@@ -1,0 +1,28 @@
+# Python bytecode and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Local application data and generated exports
+data/
+output/
+debug/
+*.db
+
+# IDE and operating-system files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

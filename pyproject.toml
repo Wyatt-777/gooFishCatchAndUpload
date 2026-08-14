@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xianyu-assistant"
+version = "0.1.0"
+description = "Windows desktop assistant for Xianyu product collection and publishing assistance."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = { text = "Proprietary" }
+authors = [{ name = "Xianyu Assistant Team" }]
+dependencies = [
+    "PyQt6>=6.7,<7.0",
+    "playwright>=1.60,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=6.10,<7",
+    "pytest>=8.0,<9.0",
+    "ruff>=0.6,<1.0",
+]
+
+[project.scripts]
+xianyu-assistant = "xianyu_assistant.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/xianyu_assistant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
