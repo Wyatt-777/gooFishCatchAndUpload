@@ -1,11 +1,13 @@
 """Settings UI for attaching to a user-started Chrome or Edge browser."""
 
 import os
+from typing import Protocol
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
@@ -13,7 +15,17 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from xianyu_assistant.browser.manager import BrowserConnectionConfig
+from xianyu_assistant.browser.manager import DEFAULT_CDP_PORT, BrowserConnectionConfig
+
+
+class BrowserSettingsStore(Protocol):
+    """Minimal persistent settings boundary used by the browser panel."""
+
+    def get_setting(self, name: str, default: str | None = None) -> str | None:
+        """Read one setting."""
+
+    def set_setting(self, name: str, value: str) -> None:
+        """Persist one setting."""
 
 
 class BrowserConnectionPanel(QGroupBox):
@@ -22,16 +34,20 @@ class BrowserConnectionPanel(QGroupBox):
     connect_requested = pyqtSignal(object)
     launch_requested = pyqtSignal(object)
 
-    def __init__(self) -> None:
+    def __init__(self, settings_store: BrowserSettingsStore | None = None) -> None:
         super().__init__("浏览器连接（Chrome / Edge）")
+        self._settings_store = settings_store
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65_535)
-        self.port_input.setValue(_default_cdp_port())
+        self.port_input.setValue(_load_cdp_port(settings_store))
         self.port_input.setAccessibleName("CDP 调试端口")
 
         self.status_label = QLabel("未连接")
         self.launch_button = QPushButton("启动 Chrome 并连接")
+        self.launch_button.setObjectName("primaryAction")
         self.connect_button = QPushButton("连接并打开闲鱼")
+        self.connect_button.setObjectName("secondaryAction")
+        self.save_port_button = QPushButton("保存端口")
 
         form = QFormLayout()
         form.addRow("连接地址：", QLabel("localhost（仅本机）"))
@@ -39,6 +55,7 @@ class BrowserConnectionPanel(QGroupBox):
         form.addRow("连接状态：", self.status_label)
 
         instructions = QPlainTextEdit()
+        instructions.setObjectName("infoPanel")
         instructions.setReadOnly(True)
         instructions.setPlainText(
             "程序启动时会自动打开独立的 Chrome/Edge 调试窗口并连接闲鱼。\n"
@@ -53,11 +70,15 @@ class BrowserConnectionPanel(QGroupBox):
         layout.addLayout(form)
         layout.addWidget(QLabel("连接说明："))
         layout.addWidget(instructions)
-        layout.addWidget(self.launch_button)
-        layout.addWidget(self.connect_button)
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.launch_button)
+        button_row.addWidget(self.connect_button)
+        button_row.addWidget(self.save_port_button)
+        layout.addLayout(button_row)
 
         self.launch_button.clicked.connect(self._emit_launch_request)
         self.connect_button.clicked.connect(self._emit_connect_request)
+        self.save_port_button.clicked.connect(self.save_connection_settings)
 
     def _emit_launch_request(self) -> None:
         self.launch_requested.emit(self.connection_config())
@@ -67,7 +88,15 @@ class BrowserConnectionPanel(QGroupBox):
 
     def connection_config(self) -> BrowserConnectionConfig:
         """Return the currently selected safe local CDP configuration."""
+        self.save_connection_settings(show_status=False)
         return BrowserConnectionConfig(port=self.port_input.value())
+
+    def save_connection_settings(self, *, show_status: bool = True) -> None:
+        """Persist the selected CDP port so every workflow uses the same value."""
+        if self._settings_store is not None:
+            self._settings_store.set_setting("browser_cdp_port", str(self.port_input.value()))
+        if show_status:
+            self.status_label.setText(f"端口已保存：{self.port_input.value()}")
 
     def set_connecting(self) -> None:
         """Prevent duplicate attempts while a worker is contacting the browser."""
@@ -96,10 +125,27 @@ class BrowserConnectionPanel(QGroupBox):
 
 
 def _default_cdp_port() -> int:
-    """Allow a local launcher to select its already-running CDP port safely."""
-    value = os.environ.get("XIANYU_CDP_PORT", "9222")
+    """Return the current managed-browser fallback when no persisted value exists."""
+    value = os.environ.get("XIANYU_CDP_PORT", str(DEFAULT_CDP_PORT))
     try:
         port = int(value)
     except ValueError:
-        return 9222
-    return port if 1 <= port <= 65_535 else 9222
+        return DEFAULT_CDP_PORT
+    return port if 1 <= port <= 65_535 else DEFAULT_CDP_PORT
+
+
+def _load_cdp_port(settings_store: BrowserSettingsStore | None) -> int:
+    """Read the persisted port, migrating the legacy environment override once."""
+    if settings_store is not None:
+        stored = settings_store.get_setting("browser_cdp_port")
+        if stored is not None:
+            try:
+                port = int(stored)
+            except ValueError:
+                port = 0
+            if 1 <= port <= 65_535:
+                return port
+        port = _default_cdp_port()
+        settings_store.set_setting("browser_cdp_port", str(port))
+        return port
+    return _default_cdp_port()

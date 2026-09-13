@@ -30,6 +30,7 @@ class PublishDialog(QDialog):
         self._product = product
         self.setWindowTitle("发布前确认")
         self.setMinimumWidth(560)
+        self.resize(680, 620)
 
         self.price_input = QLineEdit(product.price)
         self.description_input = QTextEdit(product.description)
@@ -46,6 +47,7 @@ class PublishDialog(QDialog):
             "闲鱼当前发布页没有独立标题栏。程序只会写入采集到的宝贝描述、图片和售价；"
             "图片与描述完成后才等待属性规格出现。分类及最后“发布”均须由你手动确认。"
         )
+        warning.setObjectName("warningCard")
         warning.setWordWrap(True)
 
         form = QFormLayout()
@@ -58,6 +60,7 @@ class PublishDialog(QDialog):
         form.addRow("图片：", self.images_label)
 
         self.prefill_button = QPushButton("预填到发布页（不会发布）")
+        self.prefill_button.setObjectName("primaryAction")
         self.prefill_button.clicked.connect(self._request_prefill)
         self.prefill_status_label = QLabel()
         self.prefill_status_label.setWordWrap(True)
@@ -66,6 +69,8 @@ class PublishDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
         layout.addWidget(warning)
         layout.addLayout(form)
         layout.addWidget(self.prefill_button)

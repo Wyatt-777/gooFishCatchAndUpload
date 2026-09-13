@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+import subprocess
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -18,7 +22,9 @@ from playwright.sync_api import (
 )
 
 XIANYU_HOME_URL = "https://www.goofish.com/"
+DEFAULT_CDP_PORT = 9333
 _LOCAL_CDP_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_PLAYWRIGHT_START_LOCK = threading.Lock()
 
 
 class BrowserConnectionError(RuntimeError):
@@ -29,7 +35,7 @@ class BrowserConnectionError(RuntimeError):
 class BrowserConnectionConfig:
     """Local CDP endpoint settings supplied by the settings page."""
 
-    port: int = 9222
+    port: int = DEFAULT_CDP_PORT
     host: str = "localhost"
     timeout_ms: int = 15_000
 
@@ -74,7 +80,7 @@ class BrowserManager:
 
         self._config.validate()
         try:
-            self._playwright = sync_playwright().start()
+            self._playwright = _start_playwright_without_console()
             self._browser = self._playwright.chromium.connect_over_cdp(
                 self._config.endpoint_url,
                 timeout=self._config.timeout_ms,
@@ -133,3 +139,27 @@ class BrowserManager:
         if self._context is None:
             raise BrowserConnectionError("浏览器尚未连接。")
         return self._context
+
+
+def _start_playwright_without_console() -> Playwright:
+    """Start Playwright's Node driver without creating a Windows console window."""
+    if os.name != "nt":
+        return sync_playwright().start()
+
+    # Playwright already requests SW_HIDE, but Windows may still briefly create
+    # a conhost window for its console-subsystem node.exe. CREATE_NO_WINDOW
+    # prevents that window from being created at all. Limit the temporary patch
+    # to the short driver-start interval and serialize concurrent starts.
+    with _PLAYWRIGHT_START_LOCK:
+        original_create_subprocess_exec = asyncio.create_subprocess_exec
+
+        async def create_subprocess_without_window(*args: object, **kwargs: object):
+            creation_flags = int(kwargs.get("creationflags", 0))
+            kwargs["creationflags"] = creation_flags | subprocess.CREATE_NO_WINDOW
+            return await original_create_subprocess_exec(*args, **kwargs)
+
+        asyncio.create_subprocess_exec = create_subprocess_without_window  # type: ignore[assignment]
+        try:
+            return sync_playwright().start()
+        finally:
+            asyncio.create_subprocess_exec = original_create_subprocess_exec

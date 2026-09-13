@@ -27,9 +27,8 @@ class ProductTable(QWidget):
         super().__init__()
         self.context_label = QLabel("商品列表")
         self.context_label.setObjectName("productSectionTitle")
-        self.context_label.setStyleSheet("font-size: 17px; font-weight: 700; color: #172b4d;")
         self.helper_label = QLabel("完成上方第 2 步后，导入的商品会显示在这里。")
-        self.helper_label.setStyleSheet("color: #64748b;")
+        self.helper_label.setObjectName("mutedText")
 
         self.table = QTableWidget(0, len(self._HEADERS))
         self.table.setHorizontalHeaderLabels(self._HEADERS)
@@ -64,18 +63,22 @@ class ProductTable(QWidget):
         layout.setSpacing(6)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        badge = QLabel("等待导入")
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setObjectName("emptyStateBadge")
         title = QLabel("还没有导入商品")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #334155;")
+        title.setObjectName("emptyStateTitle")
         hint = QLabel("先完成上方的「卖家主页」采集，商品会自动出现在这里。")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setStyleSheet("color: #64748b;")
+        hint.setObjectName("mutedText")
+        layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
         layout.addWidget(hint)
         return empty_state
 
     def set_products(self, source_label: str, products: list[ProductRecord]) -> None:
-        """Render products for the current source without exposing task history."""
+        """Render products for the active collection, including a reopened history batch."""
 
         self.table.setRowCount(0)
         if not products:
@@ -84,7 +87,7 @@ class ProductTable(QWidget):
             self.content_layout.setCurrentWidget(self.empty_state)
             return
 
-        self.context_label.setText(f"已导入商品 · {len(products)} 件")
+        self.context_label.setText(f"{source_label} · {len(products)} 件")
         self.helper_label.setText("下载图片后，可逐件点击「发布辅助」预填发布页；最终发布仍由你手动完成。")
         for product in products:
             self._add_product_row(product)

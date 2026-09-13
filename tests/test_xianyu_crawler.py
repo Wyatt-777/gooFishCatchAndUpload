@@ -204,6 +204,27 @@ def test_gallery_selection_keeps_thumbnail_order_and_excludes_other_images() -> 
     )
 
 
+def test_gallery_selection_matches_main_image_when_the_source_is_heic() -> None:
+    """AliCDN converts HEIC to WebP after adding its size suffix."""
+    product = ProductCandidate(
+        "item-heic-images",
+        "",
+        "",
+        "",
+        "",
+        "https://www.goofish.com/item?id=item-heic-images",
+        (),
+    )
+
+    images = _select_detail_gallery_images(
+        product,
+        ["https://img.example/gallery/one.heic_220x10000Q90.jpg_.webp"],
+        ["https://img.example/gallery/one.heic_790x10000Q90.jpg_.webp"],
+    )
+
+    assert images == ("https://img.example/gallery/one.heic_790x10000Q90.jpg_.webp",)
+
+
 def test_gallery_selection_fails_instead_of_falling_back_to_search_card_images() -> None:
     product = ProductCandidate(
         "item-no-images",

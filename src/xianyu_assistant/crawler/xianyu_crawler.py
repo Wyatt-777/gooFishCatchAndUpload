@@ -30,7 +30,14 @@ _DETAIL_THUMBNAIL_SELECTOR = (
     "[class*='item-main-window-list--'] [class*='item-main-window-list-item--'] img"
 )
 _DETAIL_CAROUSEL_IMAGE_SELECTOR = ".slick-slide:not(.slick-cloned) img"
-_IMAGE_ASSET_PATTERN = re.compile(r"(?i)^(?P<asset>.+?\.(?:jpe?g|png|webp|gif))(?:_[^/?]+)?$")
+# AliCDN retains the source file extension before it appends its presentation
+# transform.  A common example is ``photo.heic_220x10000Q90.jpg_.webp`` for a
+# thumbnail and ``photo.heic_790x10000Q90.jpg_.webp`` for the image in the
+# main viewer.  Keep the original extension set broad enough that both URLs
+# resolve to the same asset identity.
+_IMAGE_ASSET_PATTERN = re.compile(
+    r"(?i)^(?P<asset>.+?\.(?:avif|bmp|gif|heic|jpe?g|png|tiff?|webp))(?:_[^/?]+)?$"
+)
 _DETAIL_CATEGORY_API = "mtop.taobao.idle.pc.detail"
 _DETAIL_CATEGORY_LEVELS = (
     ("rootChannelCatId", "rootChannelCatName"),
@@ -296,7 +303,12 @@ def _select_detail_gallery_images(
 
 
 def _image_asset_identity(image_url: str) -> str:
-    """Ignore CDN size/quality suffixes while retaining the underlying image path."""
+    """Ignore CDN size/quality suffixes while retaining the underlying image path.
+
+    The display file may be WebP even when the source object is HEIC or another
+    image format, so the identity must use the extension preceding the CDN
+    transformation rather than only the final response format.
+    """
     path = unquote(urlsplit(image_url).path)
     match = _IMAGE_ASSET_PATTERN.fullmatch(path)
     return match.group("asset") if match else path

@@ -56,7 +56,14 @@ class BrowserLauncher:
             "--no-default-browser-check",
         ]
         try:
-            subprocess.Popen(arguments, close_fds=True)
+            creation_flags = (
+                subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            )
+            subprocess.Popen(
+                arguments,
+                close_fds=True,
+                creationflags=creation_flags,
+            )
         except OSError as error:
             raise BrowserLaunchError(f"无法启动浏览器：{executable}") from error
         return BrowserLaunchResult(executable, profile_directory, reused_running_browser=False)

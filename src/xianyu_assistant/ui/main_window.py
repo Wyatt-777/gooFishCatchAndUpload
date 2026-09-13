@@ -4,12 +4,16 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QFormLayout,
+    QFrame,
+    QGraphicsDropShadowEffect,
     QGroupBox,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -22,13 +26,19 @@ from xianyu_assistant.crawler.xianyu_crawler import (
     SellerProfileUrlError,
     validate_seller_profile_url,
 )
+from xianyu_assistant.customer_service.current_catalog import install_current_catalog
 from xianyu_assistant.debug.artifacts import DebugArtifactWriter
-from xianyu_assistant.domain.models import TaskStatus
+from xianyu_assistant.domain.models import CollectionTask, TaskStatus
+from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 from xianyu_assistant.persistence.sqlite_repository import SqliteRepository
+from xianyu_assistant.security.credential_store import KeyringCredentialStore
 from xianyu_assistant.services.collection_worker import CollectionWorker
 from xianyu_assistant.services.image_download_worker import ImageDownloadWorker
 from xianyu_assistant.services.publish_worker import PublishWorker
 from xianyu_assistant.ui.browser_connection_panel import BrowserConnectionPanel
+from xianyu_assistant.ui.collection_history_panel import CollectionHistoryPanel
+from xianyu_assistant.ui.customer_service_panel import CustomerServicePanel
+from xianyu_assistant.ui.customer_service_settings_panel import CustomerServiceSettingsPanel
 from xianyu_assistant.ui.product_table import ProductTable
 from xianyu_assistant.ui.publish_dialog import PublishDialog
 from xianyu_assistant.ui.seller_source_panel import SellerSourcePanel
@@ -45,6 +55,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__()
         self.setWindowTitle("闲鱼铺货助手")
+        self.setMinimumSize(720, 520)
         self.resize(1160, 760)
 
         self.repository = repository or SqliteRepository(
@@ -52,6 +63,13 @@ class MainWindow(QMainWindow):
             debug_writer=DebugArtifactWriter(),
         )
         self.repository.initialize()
+        customer_service_database_path = Path(
+            getattr(self.repository, "_database_path", _default_database_path())
+        )
+        self.customer_service_repository = CustomerServiceRepository(customer_service_database_path)
+        self.customer_service_repository.initialize()
+        install_current_catalog(self.customer_service_repository)
+        self.customer_service_repository.cleanup_if_due()
         self.current_collection_id: int | None = None
         self.collection_worker: CollectionWorker | None = None
         self.image_worker: ImageDownloadWorker | None = None
@@ -60,22 +78,52 @@ class MainWindow(QMainWindow):
 
         self.seller_source_panel = SellerSourcePanel()
         self.product_table = ProductTable()
-        self.browser_connection_panel = BrowserConnectionPanel()
+        self.collection_history_panel = CollectionHistoryPanel()
+        self.browser_connection_panel = BrowserConnectionPanel(self.customer_service_repository)
         self.browser_worker: BrowserConnectionWorker | None = None
         self.workflow_page = self._build_workflow_page()
+        self.settings_page = self._build_settings_page()
+        self.customer_service_settings_panel = CustomerServiceSettingsPanel(
+            self.customer_service_repository,
+            credential_store=KeyringCredentialStore(),
+            browser_config_provider=self.browser_connection_panel.connection_config,
+        )
+        self.customer_service_panel = CustomerServicePanel(
+            self.customer_service_repository,
+            self.browser_connection_panel.connection_config,
+            credential_store=KeyringCredentialStore(),
+        )
+        self.customer_service_settings_page = self._scrollable_page(
+            self.customer_service_settings_panel
+        )
+        self.customer_service_page = self._scrollable_page(self.customer_service_panel)
         self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainNavigation")
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setDrawBase(False)
         self.tabs.addTab(self.workflow_page, "开始处理")
-        self.tabs.addTab(self._build_settings_page(), "浏览器设置")
+        self.tabs.addTab(self.collection_history_panel, "历史抓取")
+        self.tabs.addTab(self.settings_page, "浏览器设置")
+        self.tabs.addTab(self.customer_service_settings_page, "客服设置")
+        self.tabs.addTab(self.customer_service_page, "客服接待")
         self.setCentralWidget(self.tabs)
         self.statusBar().showMessage("请按页面上方的步骤完成导入。")
+        QTimer.singleShot(0, self._apply_surface_shadows)
 
         self.seller_source_panel.browser_requested.connect(self.start_browser_and_connect)
         self.seller_source_panel.collect_requested.connect(self.collect_seller_profile)
         self.seller_source_panel.download_requested.connect(self.download_images)
         self.seller_source_panel.settings_requested.connect(self.show_settings)
         self.product_table.publish_requested.connect(self.show_publish_dialog)
+        self.collection_history_panel.refresh_requested.connect(self.refresh_collection_history)
+        self.collection_history_panel.task_open_requested.connect(self.open_historical_collection)
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.browser_connection_panel.connect_requested.connect(self.connect_to_browser)
         self.browser_connection_panel.launch_requested.connect(self.start_browser_and_connect)
+        self.customer_service_panel.status_changed.connect(
+            lambda message: self.statusBar().showMessage(message, 8_000)
+        )
+        self.refresh_collection_history()
         if auto_start_browser:
             QTimer.singleShot(0, self.start_browser_and_connect)
 
@@ -93,19 +141,81 @@ class MainWindow(QMainWindow):
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
         layout.addWidget(self.browser_connection_panel)
 
         data_group = QGroupBox("本地数据")
         data_form = QFormLayout(data_group)
-        data_form.addRow("商品会话：", QLabel("SQLite 本地缓存（不显示任务列表）"))
+        data_form.addRow("商品会话：", QLabel("SQLite 本地缓存（可在“历史抓取”中查看）"))
         data_form.addRow("图片：", QLabel("写入 output/images/ 目录"))
         data_form.addRow("调试证据：", QLabel("默认写入 debug/ 目录"))
         layout.addWidget(data_group)
         layout.addStretch()
         return page
 
+    def _apply_surface_shadows(self) -> None:
+        """Add restrained depth to cards without changing their geometry."""
+
+        surfaces: list[QWidget] = list(self.findChildren(QGroupBox))
+        workflow_shell = self.findChild(QFrame, "workflowShell")
+        if workflow_shell is not None:
+            surfaces.append(workflow_shell)
+        for surface in surfaces:
+            if surface.graphicsEffect() is not None:
+                continue
+            shadow = QGraphicsDropShadowEffect(surface)
+            shadow.setBlurRadius(20)
+            shadow.setOffset(0, 2)
+            shadow.setColor(QColor(35, 61, 98, 22))
+            surface.setGraphicsEffect(shadow)
+
     def show_settings(self) -> None:
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentWidget(self.settings_page)
+
+    def show_customer_service_settings(self) -> None:
+        """Open the explicit customer-service configuration page."""
+        self.tabs.setCurrentWidget(self.customer_service_settings_page)
+
+    @staticmethod
+    def _scrollable_page(content: QWidget) -> QScrollArea:
+        """Keep content reachable without imposing its full height on the window."""
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setWidget(content)
+        return scroll_area
+
+    def _tab_changed(self, index: int) -> None:
+        if self.tabs.widget(index) is self.collection_history_panel:
+            self.refresh_collection_history()
+        elif self.tabs.widget(index) is self.customer_service_page:
+            self.customer_service_panel.refresh_price_changes()
+
+    def refresh_collection_history(self) -> None:
+        """Show every locally retained collection without touching browser state."""
+
+        self.collection_history_panel.set_tasks(self.repository.list_tasks())
+
+    def open_historical_collection(self, collection_id: int) -> None:
+        """Restore an older batch as the active batch for review and image download."""
+
+        try:
+            collection = self.repository.get_task(collection_id)
+        except KeyError:
+            self.refresh_collection_history()
+            self.statusBar().showMessage("该历史记录已不存在，请刷新后重试。", 5000)
+            return
+        products = self.repository.list_products(collection_id)
+        self.current_collection_id = collection_id
+        self.product_table.set_products(self._history_label(collection), products)
+        self.seller_source_panel.set_history_result(len(products))
+        self.tabs.setCurrentWidget(self.workflow_page)
+        self.statusBar().showMessage(f"已打开历史抓取 #{collection.id}：{len(products)} 件商品。", 5000)
+
+    @staticmethod
+    def _history_label(collection: CollectionTask) -> str:
+        return f"历史抓取 #{collection.id}"
 
     def start_browser_and_connect(self, config: BrowserConnectionConfig | None = None) -> None:
         config = config or self.browser_connection_panel.connection_config()
@@ -164,7 +274,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(str(error), 7000)
             return
 
-        # This history is a recoverable cache. It is deliberately not a user-facing task list.
+        # Every collection is retained locally and can later be reopened from the history tab.
         collection = self.repository.create_task(profile_url)
         self.repository.transition_task(collection.id, TaskStatus.RUNNING)
         worker = CollectionWorker(
@@ -188,10 +298,12 @@ class MainWindow(QMainWindow):
         self.product_table.set_products("卖家主页导入", products)
         self.tabs.setCurrentWidget(self.workflow_page)
         self.seller_source_panel.set_result(len(products))
+        self.refresh_collection_history()
         self.statusBar().showMessage(f"采集完成：新增 {inserted_count} 件商品。", 5000)
 
     def _collection_failed(self, _collection_id: int, message: str) -> None:
         self.seller_source_panel.set_error(message)
+        self.refresh_collection_history()
         self.statusBar().showMessage(f"卖家主页采集失败：{message}", 10_000)
 
     def _collection_worker_finished(self) -> None:

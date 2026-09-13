@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <body>
+    <aside id="fixture-conversations">
+      <div class="conversation" data-conversation-key="conversation-1" data-unread="true">
+        顾客一
+      </div>
+      <div class="conversation" data-conversation-key="conversation-old" data-unread="false">
+        顾客旧会话
+      </div>
+    </aside>
+    <main id="fixture-chat" data-conversation-key="conversation-1">
+      <article class="message" data-message-key="message-1" data-direction="incoming" data-message-kind="text">
+        <span class="message-text">请问什么时候发货</span>
+      </article>
+      <article class="message" data-message-key="message-2" data-direction="outgoing" data-message-kind="text">
+        <span class="message-text">今天可以发出</span>
+      </article>
+      <article class="message" data-message-key="message-3" data-direction="incoming" data-message-kind="image">
+        <span class="incoming-image">图片</span>
+      </article>
+      <div class="product-card" data-product-id="product-1" data-product-title="测试商品">测试商品</div>
+    </main>
+  </body>
+</html>

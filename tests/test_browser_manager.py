@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from xianyu_assistant.browser import manager as manager_module
 from xianyu_assistant.browser.manager import (
+    DEFAULT_CDP_PORT,
     XIANYU_HOME_URL,
     BrowserConnectionConfig,
     BrowserConnectionError,
     BrowserManager,
 )
+
+
+def test_default_cdp_port_matches_the_persisted_browser_setup() -> None:
+    assert BrowserConnectionConfig().port == DEFAULT_CDP_PORT == 9333
 
 
 class FakePage:
@@ -104,6 +111,38 @@ def test_cdp_connection_opens_xianyu_without_closing_user_browser(
     assert len(fake_playwright.chromium.browser.contexts[0].pages) == 2
     assert fake_playwright.chromium.browser.contexts[0].pages[-1].brought_to_front is True
     assert fake_playwright.stopped is True
+
+
+def test_playwright_driver_uses_no_window_creation_flag_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if manager_module.os.name != "nt":
+        pytest.skip("Windows-only process creation behavior")
+    observed_options: dict[str, object] = {}
+
+    async def fake_create_subprocess_exec(*_args: object, **kwargs: object) -> object:
+        observed_options.update(kwargs)
+        return object()
+
+    class StartingPlaywright:
+        def start(self) -> FakePlaywright:
+            asyncio.run(manager_module.asyncio.create_subprocess_exec("node.exe"))
+            return FakePlaywright()
+
+    monkeypatch.setattr(
+        manager_module.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(manager_module, "sync_playwright", StartingPlaywright)
+
+    result = manager_module._start_playwright_without_console()
+
+    assert isinstance(result, FakePlaywright)
+    assert (
+        int(observed_options["creationflags"])
+        & manager_module.subprocess.CREATE_NO_WINDOW
+    )
 
 
 @pytest.mark.parametrize(

@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ['playwright.sync_api']
+hiddenimports = ['playwright.sync_api', 'keyring.backends.Windows', 'win32ctypes.pywin32.win32cred', 'win32ctypes.pywin32.pywintypes']
 tmp_ret = collect_all('playwright')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

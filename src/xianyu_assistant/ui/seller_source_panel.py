@@ -30,53 +30,53 @@ class SellerSourcePanel(QWidget):
             QWidget#sellerWorkflow { background: transparent; border: none; }
             QFrame#workflowShell {
                 background: #ffffff;
-                border: 1px solid #e2e8f0;
-                border-radius: 12px;
+                border: 1px solid #dce4ef;
+                border-radius: 14px;
             }
-            QFrame#workflowDivider { background: #e2e8f0; max-width: 1px; }
-            QLabel#workflowTitle { color: #172b4d; font-size: 20px; font-weight: 700; }
-            QLabel#workflowSubtitle { color: #64748b; }
-            QLabel#stepCaption { color: #64748b; font-size: 12px; font-weight: 700; }
-            QLabel#stepTitle { color: #1e293b; font-size: 15px; font-weight: 700; }
-            QLabel#stepHint { color: #64748b; }
+            QFrame#workflowDivider { background: #e5ebf3; max-width: 1px; }
+            QLabel#workflowTitle { color: #172033; font-size: 21px; font-weight: 700; }
+            QLabel#workflowSubtitle { color: #68778c; }
+            QLabel#stepCaption { color: #728198; font-size: 12px; font-weight: 700; }
+            QLabel#stepTitle { color: #27364b; font-size: 15px; font-weight: 700; }
+            QLabel#stepHint { color: #68778c; }
             QLabel#progressPill {
-                background: #eff6ff;
-                border: 1px solid #dbeafe;
+                background: #edf4ff;
+                border: 1px solid #cfddf7;
                 border-radius: 12px;
-                color: #2563eb;
+                color: #2f6bcf;
                 font-size: 12px;
                 font-weight: 700;
                 padding: 3px 9px;
             }
             QFrame#quantityControl {
-                background: #ffffff;
-                border: 1px solid #cbd5e1;
+                background: #fbfdff;
+                border: 1px solid #cbd6e4;
                 border-radius: 8px;
             }
-            QFrame#quantityControl:focus-within { border: 2px solid #3b82f6; }
+            QFrame#quantityControl:focus-within { border: 2px solid #4b82ee; }
             QPushButton#quantityButton {
                 background: transparent;
                 border: none;
                 border-radius: 6px;
-                color: #475569;
+                color: #506279;
                 font-size: 18px;
                 font-weight: 500;
                 min-height: 28px;
                 min-width: 28px;
                 padding: 0;
             }
-            QPushButton#quantityButton:hover { background: #eff6ff; color: #2563eb; }
-            QPushButton#quantityButton:disabled { background: transparent; color: #cbd5e1; }
+            QPushButton#quantityButton:hover { background: #edf4ff; color: #2f6fed; }
+            QPushButton#quantityButton:disabled { background: transparent; color: #cbd6e4; }
             QSpinBox#quantityInput {
                 background: transparent;
                 border: none;
-                color: #172b4d;
+                color: #172033;
                 font-weight: 600;
                 min-height: 28px;
                 padding: 0 2px;
             }
             QSpinBox#quantityInput:focus { border: none; }
-            QLabel#quantityUnit { color: #64748b; }
+            QLabel#quantityUnit { color: #68778c; }
             """
         )
 
@@ -288,6 +288,15 @@ class SellerSourcePanel(QWidget):
         self.status_label.setText(f"已采集 {count} 件商品，可以下载图片。")
         self.download_button.setEnabled(count > 0)
         self.download_status_label.setText("下载当前批次的全部商品图片。")
+
+    def set_history_result(self, count: int) -> None:
+        """Make a reopened history batch behave like the active import batch."""
+
+        self.status_label.setStyleSheet("color: #16803c;")
+        self.status_label.setText(f"已打开历史抓取，包含 {count} 件商品。")
+        self.download_button.setEnabled(count > 0)
+        self.download_status_label.setStyleSheet("color: #64748b;")
+        self.download_status_label.setText("可下载当前历史批次中尚未保存的图片。")
 
     def set_downloading(self) -> None:
         self.download_button.setEnabled(False)

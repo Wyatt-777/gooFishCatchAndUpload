@@ -22,12 +22,17 @@ def test_launcher_starts_chrome_with_an_isolated_local_cdp_profile(
     executable = tmp_path / "chrome.exe"
     executable.touch()
     launched_arguments: list[str] = []
+    launched_options: dict[str, object] = {}
     monkeypatch.setattr(launcher_module, "_is_cdp_endpoint_available", lambda _config: False)
     monkeypatch.setattr(launcher_module, "_browser_executable_candidates", lambda: (executable,))
     monkeypatch.setattr(
         launcher_module.subprocess,
         "Popen",
-        lambda arguments, **_kwargs: launched_arguments.extend(arguments) or FakeProcess(),
+        lambda arguments, **kwargs: (
+            launched_arguments.extend(arguments)
+            or launched_options.update(kwargs)
+            or FakeProcess()
+        ),
     )
 
     profile_directory = tmp_path / "chrome-cdp-profile"
@@ -48,6 +53,7 @@ def test_launcher_starts_chrome_with_an_isolated_local_cdp_profile(
         "--no-first-run",
         "--no-default-browser-check",
     ]
+    assert launched_options["creationflags"] == launcher_module.subprocess.CREATE_NO_WINDOW
 
 
 def test_launcher_reuses_an_existing_local_cdp_browser(monkeypatch: pytest.MonkeyPatch) -> None:
