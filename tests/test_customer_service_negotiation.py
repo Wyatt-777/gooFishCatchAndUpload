@@ -145,6 +145,30 @@ def test_conditional_purchase_keeps_previously_accepted_price() -> None:
     assert followup.accepted_price == "650"
 
 
+def test_purchase_howto_keeps_previously_accepted_price_without_requesting_price_change(
+) -> None:
+    accepted = _plan("378可以吗", "6020")
+    followup = _plan("怎么拍下", "6020", previous=accepted.next_state)
+
+    assert followup.outcome == "accept"
+    assert followup.accepted_price == "378"
+    assert followup.reply_price == "378"
+    assert followup.is_order_request is False
+    assert followup.fallback_reply == "直接拍下就行 还是按378"
+
+
+def test_purchase_howto_does_not_flip_to_opening_counter_after_price_correction() -> None:
+    accepted = _plan("378可以吗", "6020")
+    first_howto = _plan("怎么拍下", "6020", previous=accepted.next_state)
+    correction = _plan("你上面不是说378", "6020", previous=first_howto.next_state)
+    second_howto = _plan("怎么拍下", "6020", previous=correction.next_state)
+
+    assert first_howto.outcome == second_howto.outcome == "accept"
+    assert first_howto.accepted_price == second_howto.accepted_price == "378"
+    assert "388" not in first_howto.fallback_reply
+    assert "388" not in second_howto.fallback_reply
+
+
 def test_plain_order_request_does_not_trigger_an_unasked_discount() -> None:
     product = _product("6020")
 

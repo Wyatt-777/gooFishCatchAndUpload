@@ -23,7 +23,7 @@ def test_customer_service_config_uses_the_v1_defaults() -> None:
     assert config.mode is ReceptionMode.HUMAN_CONFIRMATION
     assert config.poll_interval_seconds == 2
     assert config.max_conversations_per_poll == 10
-    assert config.debounce_seconds == 3
+    assert config.debounce_seconds == 6
 
 
 def test_reception_session_can_start_stop_and_halt_then_restart() -> None:

@@ -58,6 +58,17 @@ class PriceChangeStatus(StrEnum):
     FAILED = "failed"
 
 
+class SalesStage(StrEnum):
+    """Deterministic commercial-conversation stages used outside the model."""
+
+    QUALIFY = "qualify"
+    RECOMMEND = "recommend"
+    PROVE_VALUE = "prove_value"
+    CLOSE = "close"
+    FOLLOWED_UP = "followed_up"
+    PAUSED = "paused"
+
+
 class MessageDirection(StrEnum):
     """Whether a message was sent by the customer or the merchant."""
 
@@ -97,13 +108,16 @@ class CustomerServiceConfig:
     mode: ReceptionMode = ReceptionMode.HUMAN_CONFIRMATION
     poll_interval_seconds: int = 2
     max_conversations_per_poll: int = 10
-    debounce_seconds: int = 3
+    debounce_seconds: int = 6
     max_context_messages: int = 20
     max_context_characters: int = 12_000
     max_reply_text_length: int = 2_000
     max_model_attempts: int = 2
     max_send_failures: int = 3
     max_model_failures: int = 3
+    sales_follow_up_delay_minutes: int = 30
+    sales_follow_up_start_hour: int = 9
+    sales_follow_up_end_hour: int = 22
 
     def __post_init__(self) -> None:
         """Normalize enum-like input and reject unsafe runtime parameters."""
@@ -119,10 +133,17 @@ class CustomerServiceConfig:
             "max_model_attempts",
             "max_send_failures",
             "max_model_failures",
+            "sales_follow_up_delay_minutes",
         )
         for field_name in positive_fields:
             if getattr(self, field_name) <= 0:
                 raise ValueError(f"{field_name} 必须大于 0。")
+        if not 0 <= self.sales_follow_up_start_hour <= 23:
+            raise ValueError("sales_follow_up_start_hour 必须在 0 到 23 之间。")
+        if not 1 <= self.sales_follow_up_end_hour <= 24:
+            raise ValueError("sales_follow_up_end_hour 必须在 1 到 24 之间。")
+        if self.sales_follow_up_start_hour >= self.sales_follow_up_end_hour:
+            raise ValueError("销售追问结束时间必须晚于开始时间。")
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +321,36 @@ class ReplyProposal:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "facts_used", tuple(self.facts_used))
+
+
+@dataclass(frozen=True, slots=True)
+class SalesState:
+    """Persisted sales progression and at-most-once silent-customer follow-up."""
+
+    conversation_key: str
+    product_key: str | None
+    stage: SalesStage
+    follow_up_text: str | None = None
+    follow_up_due_at: datetime | None = None
+    follow_up_count: int = 0
+    last_customer_message_key: str | None = None
+    last_merchant_fingerprint: str | None = None
+    status: str = "pending"
+    updated_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.conversation_key.strip():
+            raise ValueError("销售状态必须绑定会话。")
+        if not isinstance(self.stage, SalesStage):
+            object.__setattr__(self, "stage", SalesStage(self.stage))
+        if self.follow_up_count < 0:
+            raise ValueError("销售追问次数不能小于 0。")
+        if self.status not in {"pending", "followed_up", "cancelled", "paused"}:
+            raise ValueError("销售状态无效。")
+        if self.status == "pending" and (
+            not self.follow_up_text or self.follow_up_due_at is None
+        ):
+            raise ValueError("待追问状态必须包含话术和到期时间。")
 
 
 @dataclass(frozen=True, slots=True)

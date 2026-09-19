@@ -9,11 +9,17 @@ from decimal import Decimal
 
 from xianyu_assistant.customer_service.models import ProductKnowledge, ReplyProposal
 from xianyu_assistant.customer_service.price_change import format_money, parse_money
+from xianyu_assistant.customer_service.semantic_analysis import CustomerSemantics
 
-_MODEL_NUMBER_RE = re.compile(r"(?<!\d)(?:6020|6030|4830)(?!\d)")
+_MODEL_NUMBER_RE = re.compile(r"(?<!\d)(?:(?:48|60)\d{2})(?!\d)")
 _VOLTAGE_CAPACITY_RE = re.compile(
-    r"(?<!\d)\d+(?:\.\d+)?\s*(?:ah|安时|v|伏|a|安)",
+    r"(?<!\d)\d+(?:\.\d+)?\s*(?:ah|安时|v|伏|a|安|km|公里|w|瓦|%|厘米|cm|mm)",
     re.IGNORECASE,
+)
+_DIMENSION_RE = re.compile(r"(?<!\d)\d+(?:\.\d+)?(?:\s*[-x×*]\s*\d+(?:\.\d+)?){1,3}(?!\d)")
+_YEAR_OR_HEALTH_RE = re.compile(r"(?<!\d)\d+(?:\.\d+)?\s*(?:年|健康度|以上)")
+_MONEY_UNIT_RE = re.compile(
+    r"(?:[¥￥]\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:元|块钱|块))"
 )
 _QUANTITY_RE = re.compile(r"(?<!\d)(\d+|[一二两三四五六七八九十两]+)\s*(?:组|套|只|个)(?!人)")
 _MONEY_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)")
@@ -35,6 +41,8 @@ _NEGOTIATION_MARKERS = (
     "可以不",
     "行不行",
     "行吗",
+    "别人",
+    "别家",
 )
 _ORDER_MARKERS = (
     "拍下",
@@ -52,6 +60,16 @@ _CONDITIONAL_PURCHASE_MARKERS = (
     "能的话",
     "我就拍",
     "就拍下",
+)
+_PURCHASE_HOWTO_MARKERS = (
+    "怎么拍下",
+    "怎么拍",
+    "如何拍下",
+    "如何拍",
+    "怎么下单",
+    "如何下单",
+    "在哪拍",
+    "哪里拍",
 )
 _PRICE_QUERY_MARKERS = ("多少钱", "多钱", "什么价", "啥价", "价格", "价钱", "怎么卖", "咋卖")
 _REJECTION_MARKERS = (
@@ -174,13 +192,23 @@ def quantity_from_messages(current_query: str, prior_customer_texts: tuple[str, 
     return 1
 
 
-def _offer_from_query(query: str) -> Decimal | None:
+def _offer_from_query(query: str, *, allow_contextual_bare: bool = False) -> Decimal | None:
+    explicit = list(_MONEY_UNIT_RE.finditer(query))
+    if explicit:
+        return Decimal(explicit[-1].group(1) or explicit[-1].group(2))
     cleaned = _MODEL_NUMBER_RE.sub(" ", query)
     cleaned = _VOLTAGE_CAPACITY_RE.sub(" ", cleaned)
+    cleaned = _DIMENSION_RE.sub(" ", cleaned)
+    cleaned = _YEAR_OR_HEALTH_RE.sub(" ", cleaned)
     quantity_match = _QUANTITY_RE.search(cleaned)
     if quantity_match is not None:
         start, end = quantity_match.span(1)
         cleaned = cleaned[:start] + " " * (end - start) + cleaned[end:]
+    has_price_language = _is_negotiation_text(query) or any(
+        marker in query for marker in _ORDER_MARKERS
+    )
+    if not has_price_language and not allow_contextual_bare:
+        return None
     candidates: list[Decimal] = []
     for match in _MONEY_RE.finditer(cleaned):
         amount = Decimal(match.group(1))
@@ -208,12 +236,20 @@ def build_negotiation_plan(
     quantity: int,
     opening_counter: str | None,
     previous: NegotiationState | None,
+    semantics: CustomerSemantics | None = None,
 ) -> NegotiationPlan | None:
     if knowledge is None or not knowledge.listed_price or not knowledge.minimum_price:
         return None
     same_previous = previous if previous and previous.product_key == knowledge.product_key else None
-    offer = _offer_from_query(query)
-    is_order_request = any(marker in query for marker in _ORDER_MARKERS)
+    offer = (
+        Decimal(semantics.money_offer)
+        if semantics is not None and semantics.is_negotiation and semantics.money_offer
+        else _offer_from_query(query, allow_contextual_bare=same_previous is not None)
+    )
+    is_purchase_howto = any(marker in query for marker in _PURCHASE_HOWTO_MARKERS)
+    is_order_request = (
+        any(marker in query for marker in _ORDER_MARKERS) and not is_purchase_howto
+    )
     is_conditional_purchase = any(marker in query for marker in _CONDITIONAL_PURCHASE_MARKERS)
     asks_negotiation = _is_negotiation_text(query)
     asks_quantity_price = quantity > 1 and any(marker in query for marker in _PRICE_QUERY_MARKERS)
@@ -229,6 +265,7 @@ def build_negotiation_plan(
         offer is None
         and not asks_negotiation
         and not is_conditional_purchase
+        and not (is_purchase_howto and same_previous is not None)
         and not asks_quantity_price
         and not (is_order_request and same_previous is not None)
     ):
@@ -269,7 +306,9 @@ def build_negotiation_plan(
         )
 
     if offer is None and same_previous is not None:
-        if is_conditional_purchase and same_previous.outcome == "accept":
+        if same_previous.outcome == "accept" and (
+            is_conditional_purchase or is_purchase_howto or is_order_request
+        ):
             accepted = same_previous.accepted_price
             assert accepted is not None
             state = NegotiationState(
@@ -291,8 +330,12 @@ def build_negotiation_plan(
                 _plain_money(listed_total),
                 _plain_money(minimum_total),
                 is_order_request,
-                f"确认此前已接受的成交价{accepted}，简短让顾客拍下。",
-                f"可以 {accepted}拍下",
+                f"确认此前已接受的成交价{accepted}，简短告诉顾客如何继续拍下。",
+                (
+                    f"直接拍下就行 还是按{accepted}"
+                    if is_purchase_howto
+                    else f"可以 {accepted}拍下"
+                ),
                 state,
             )
         counter = same_previous.last_counter or _plain_money(opening_total)

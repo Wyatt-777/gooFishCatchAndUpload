@@ -16,6 +16,7 @@ from simulate_customer_service_dialogues import (
     SimulationRepository,
 )
 
+from xianyu_assistant.customer_service.current_catalog import FIRST_CONTACT_CATALOG_REPLY
 from xianyu_assistant.customer_service.customer_service_worker import CustomerServiceWorker
 from xianyu_assistant.customer_service.deepseek_client import DeepSeekClient
 from xianyu_assistant.customer_service.models import (
@@ -197,7 +198,10 @@ def run_journey(
             break
         else:
             latest_draft = list(repository.drafts.values())[-1]
-            failures.append(f"第{index}轮未回复，状态为{latest_draft.status.value}")
+            failure_detail = latest_draft.failure_reason or "未记录原因"
+            failures.append(
+                f"第{index}轮未回复，状态为{latest_draft.status.value}：{failure_detail}"
+            )
             if latest_draft.status is ReplyJobStatus.FAILED:
                 break
 
@@ -212,6 +216,26 @@ def run_journey(
         }
         for task in repository.price_changes
     ]
+    merchant_replies = [
+        item["text"] for item in transcript if item["speaker"] == "商家"
+    ]
+    catalog_occurrences = sum(
+        reply.count(FIRST_CONTACT_CATALOG_REPLY) for reply in merchant_replies
+    )
+    if merchant_replies and catalog_occurrences != 1:
+        failures.append(f"首次目录应且仅应发送1次，实际为{catalog_occurrences}次")
+    if merchant_replies and not merchant_replies[0].startswith(FIRST_CONTACT_CATALOG_REPLY):
+        failures.append("首次目录没有位于第一条商家回复开头")
+    if any(FIRST_CONTACT_CATALOG_REPLY in reply for reply in merchant_replies[1:]):
+        failures.append("首次目录在后续轮次重复发送")
+    if any("60-70" in reply or "60—70" in reply for reply in merchant_replies):
+        failures.append("回复仍包含已废弃的6030续航60-70公里")
+    if journey.name == "6020连续压价" and len(merchant_replies) >= 4:
+        for turn_number, reply in ((3, merchant_replies[2]), (4, merchant_replies[3])):
+            if "378" not in reply or any(
+                marker in reply for marker in ("不行", "出不了", "做不到", "不能", "不卖")
+            ):
+                failures.append(f"第{turn_number}轮没有保持378元成交承诺")
     return {
         "journey": journey.name,
         "transcript": transcript,
@@ -230,7 +254,15 @@ def main() -> int:
         type=Path,
         default=Path("output/客服完整多轮对话模拟_10用户.json"),
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="只运行前 N 个完整虚拟顾客旅程。",
+    )
     args = parser.parse_args()
+    if args.limit is not None and not 1 <= args.limit <= len(JOURNEYS):
+        parser.error(f"--limit 必须在 1 到 {len(JOURNEYS)} 之间")
     database_path = (
         Path(os.environ.get("LOCALAPPDATA", str(Path.cwd())))
         / "XianyuAssistant"
@@ -239,7 +271,11 @@ def main() -> int:
     repository = CustomerServiceRepository(database_path)
     settings = _settings(repository)
     model = DeepSeekClient(settings, KeyringCredentialStore())
-    results = [run_journey(journey, repository, model, settings) for journey in JOURNEYS]
+    selected_journeys = JOURNEYS[: args.limit] if args.limit is not None else JOURNEYS
+    results = [
+        run_journey(journey, repository, model, settings)
+        for journey in selected_journeys
+    ]
     report = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "safety": "Synthetic multi-turn conversations only; no browser or Xianyu adapter was used.",

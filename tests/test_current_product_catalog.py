@@ -109,6 +109,9 @@ def test_current_catalog_archives_old_rows_and_installs_three_authoritative_prod
         and "40元" not in product.supplementary_knowledge
         for product in enabled
     )
+    assert all("默认赠送充电器" in product.supplementary_knowledge for product in enabled)
+    assert all("海南不发货" in product.shipping_notes for product in enabled)
+    assert all("质保一年" in product.after_sales_notes for product in enabled)
     assert install_current_catalog(repository) is False
 
 

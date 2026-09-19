@@ -27,6 +27,7 @@ from xianyu_assistant.customer_service.models import (
     PriceChangeReceipt,
     ProductKnowledge,
     ReplyDraft,
+    SalesState,
     SendReceipt,
 )
 
@@ -204,5 +205,109 @@ class CustomerServiceRepository(Protocol):
     def add_processed_fingerprint(self, batch_fingerprint: str, observed_at: datetime) -> None:
         """Persist a one-way batch fingerprint without storing message text."""
 
+    def observe_customer_turn(
+        self,
+        *,
+        turn_id: str,
+        conversation_key: str,
+        message_keys: Sequence[str],
+        customer_text: str,
+        platform_product_id: str | None,
+        observed_at: datetime,
+    ) -> int:
+        """Persist a complete customer turn and return its conversation version."""
+
+    def update_customer_turn(
+        self,
+        turn_id: str,
+        *,
+        status: str,
+        semantic_json: str | None = None,
+        decision_json: str | None = None,
+        reply_text: str | None = None,
+        failure_reason: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> None:
+        """Update the replayable semantic, decision, reply, and status audit."""
+
+    def should_send_first_contact_catalog(
+        self,
+        conversation_key: str,
+        *,
+        snapshot_has_outgoing: bool,
+    ) -> bool:
+        """Return whether the one-time first-conversation catalog is still eligible."""
+
+    def reserve_first_contact_catalog(
+        self,
+        conversation_key: str,
+        *,
+        reservation_id: str,
+        reply_fingerprint: str,
+        created_at: datetime,
+    ) -> bool:
+        """Reserve the welcome catalog before attempting its combined send."""
+
+    def release_first_contact_catalog_reservation(
+        self,
+        conversation_key: str,
+        *,
+        reservation_id: str,
+    ) -> None:
+        """Release a welcome reservation after a proven no-op send."""
+
+    def mark_first_contact_catalog_sent(
+        self,
+        conversation_key: str,
+        *,
+        reservation_id: str,
+        updated_at: datetime,
+    ) -> None:
+        """Permanently mark the one-time catalog after outgoing read-back."""
+
+    def reserve_send(
+        self,
+        *,
+        send_id: str,
+        turn_id: str,
+        conversation_key: str,
+        expected_version: int,
+        expected_last_message_key: str,
+        expected_product_id: str | None,
+        reply_fingerprint: str,
+        created_at: datetime,
+    ) -> bool:
+        """Reserve a send only if the expected conversation version is current."""
+
+    def mark_send_verified(
+        self,
+        send_id: str,
+        *,
+        outgoing_message_key: str,
+        handled_message_key: str,
+        updated_at: datetime,
+    ) -> None:
+        """Close the outbox entry after the exact outgoing message is observed."""
+
     def save_human_confirmed_example(self, example: HistoricalExample) -> None:
         """Store a manually approved Q&A as a high-trust wording example."""
+
+    def save_sales_state(self, state: SalesState) -> None:
+        """Persist one sales stage and its optional at-most-once follow-up."""
+
+    def cancel_sales_follow_up(self, conversation_key: str, *, updated_at: datetime) -> None:
+        """Cancel a pending follow-up because the customer or operator acted."""
+
+    def list_due_sales_follow_ups(
+        self, *, now: datetime, limit: int
+    ) -> Sequence[SalesState]:
+        """Return pending follow-ups due at or before the supplied wall clock."""
+
+    def mark_sales_follow_up_sent(
+        self,
+        conversation_key: str,
+        *,
+        merchant_fingerprint: str,
+        updated_at: datetime,
+    ) -> None:
+        """Atomically close a pending follow-up after verified delivery."""

@@ -351,6 +351,14 @@ def test_unmounted_selected_conversation_is_still_polled() -> None:
     ]
 
 
+def test_open_conversation_fails_if_active_identity_does_not_switch() -> None:
+    page = FakePage()
+    adapter = _adapter(page)
+
+    with pytest.raises(ChatAdapterError, match="未确认切换"):
+        adapter.open_conversation("conversation-old")
+
+
 def test_approved_text_send_is_verified_by_a_new_outgoing_message() -> None:
     adapter = _adapter(FakePage())
     adapter.open_conversation("conversation-1")

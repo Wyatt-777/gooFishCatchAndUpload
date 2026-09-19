@@ -521,16 +521,43 @@ class PlaywrightXianyuChatAdapter:
     def _select_conversation(
         self, page: PageLike, item: LocatorLike, conversation_key: str
     ) -> None:
-        self._selected_conversation_key = conversation_key
-        self._selected_session_info = self._session_info(item)
+        selected_session_info = self._session_info(item)
         try:
             item.click(force=True, no_wait_after=True)
         except TypeError:
             # Keep the fake/test locator contract intentionally small.
             item.click()
+        self._wait_for_conversation_selection(page, conversation_key)
+        self._selected_conversation_key = conversation_key
+        self._selected_session_info = selected_session_info
+
+    def _wait_for_conversation_selection(
+        self,
+        page: PageLike,
+        conversation_key: str,
+    ) -> None:
+        """Require two stable active-row identity reads after a conversation click."""
+        selector = self._contract.selectors.active_conversation_selector
+        if not selector:
+            raise ChatAdapterError("客服页面缺少活动会话身份选择器。")
         wait_for_timeout = getattr(page, "wait_for_timeout", None)
-        if callable(wait_for_timeout):
-            wait_for_timeout(250)
+        stable_reads = 0
+        for _ in range(20):
+            active = page.locator(selector)
+            if active.count() == 1:
+                try:
+                    actual_key = self._conversation_key(active, 0)
+                except ChatAdapterError:
+                    actual_key = ""
+                if actual_key == conversation_key:
+                    stable_reads += 1
+                    if stable_reads >= 2:
+                        return
+                else:
+                    stable_reads = 0
+            if callable(wait_for_timeout):
+                wait_for_timeout(100)
+        raise ChatAdapterError("页面未确认切换到目标会话，禁止读取或发送。")
 
     def _try_select_visible_conversation(self, page: PageLike, conversation_key: str) -> bool:
         """Match React-backed rows in one DOM evaluation before using dynamic locators."""
@@ -966,15 +993,21 @@ class PlaywrightXianyuChatAdapter:
 
     def _current_conversation_key(self, page: PageLike) -> str:
         selectors = self._contract.selectors
-        # open_conversation records the stable React session key before the
-        # click. The rendered header often has no stable DOM attribute and
-        # must not replace that key with a text hash.
-        if self._selected_conversation_key:
-            return self._selected_conversation_key
         if selectors.active_conversation_selector:
             active = page.locator(selectors.active_conversation_selector)
             if active.count() == 1:
-                return self._conversation_key(active, 0)
+                actual = self._conversation_key(active, 0)
+                if (
+                    self._selected_conversation_key is not None
+                    and actual != self._selected_conversation_key
+                ):
+                    raise ChatAdapterError("页面活动会话与目标会话不一致。")
+                return actual
+        # The virtual list may unmount the active row after a previously
+        # verified switch.  Only then may the cached stable session key be
+        # used; it is never written before the switch acknowledgement.
+        if self._selected_conversation_key:
+            return self._selected_conversation_key
         if selectors.current_conversation_selector:
             current = page.locator(selectors.current_conversation_selector)
             if current.count() == 1:
@@ -1188,8 +1221,37 @@ class PlaywrightXianyuChatAdapter:
         kind: MessageKind,
         text: str,
     ) -> str:
-        return item.get_attribute(self._contract.selectors.message_key_attribute) or hashlib.sha256(
-            f"{index}:{direction.value}:{kind.value}:{text}".encode()
+        attribute = item.get_attribute(self._contract.selectors.message_key_attribute)
+        if attribute:
+            return attribute
+        if hasattr(item, "evaluate"):
+            try:
+                react_key = item.evaluate(
+                    """element => {
+                        const fiberKey = Object.keys(element).find(key => key.startsWith('__reactFiber'));
+                        let fiber = fiberKey ? element[fiberKey] : null;
+                        for (let depth = 0; fiber && depth < 12; depth++, fiber = fiber.return) {
+                            const props = fiber.memoizedProps || {};
+                            const candidates = [props, props.message, props.messageInfo, props.data];
+                            for (const value of candidates) {
+                                if (!value || typeof value !== 'object') continue;
+                                const id = value.messageId ?? value.msgId ?? value.message_id ??
+                                    value.uuid ?? value.id;
+                                if (id !== undefined && id !== null && String(id).length > 0) {
+                                    return String(id);
+                                }
+                            }
+                        }
+                        return null;
+                    }"""
+                )
+                if isinstance(react_key, (str, int)) and str(react_key).strip():
+                    return f"message-{react_key}"
+            except (AttributeError, PlaywrightError, RuntimeError, TypeError, ValueError):
+                pass
+        timestamp = item.get_attribute(self._contract.selectors.platform_time_attribute) or ""
+        return hashlib.sha256(
+            f"{index}:{direction.value}:{kind.value}:{timestamp}:{text}".encode()
         ).hexdigest()
 
 

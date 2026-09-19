@@ -28,6 +28,7 @@ from xianyu_assistant.customer_service.models import (
     ReceptionMode,
     ReplyDraft,
     ReplyJobStatus,
+    SalesState,
     SendReceipt,
 )
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
@@ -138,6 +139,9 @@ class SimulationRepository:
         self.processed: set[str] = set()
         self.handoffs: list[str] = []
         self.price_changes: list[PriceChangeDraft] = []
+        self.first_contact: dict[str, tuple[str, str]] = {}
+        self.negotiation_states: dict[str, tuple[object, str]] = {}
+        self.sales_states: dict[str, SalesState] = {}
 
     def find_product_knowledge(self, **kwargs):
         return self.source.find_product_knowledge(**kwargs)
@@ -163,14 +167,87 @@ class SimulationRepository:
             for draft in self.drafts.values()
         )
 
+    def should_send_first_contact_catalog(
+        self, conversation_key: str, *, snapshot_has_outgoing: bool
+    ) -> bool:
+        return (
+            not self.has_prior_turn
+            and not snapshot_has_outgoing
+            and conversation_key not in self.first_contact
+        )
+
+    def reserve_first_contact_catalog(
+        self,
+        conversation_key: str,
+        *,
+        reservation_id: str,
+        reply_fingerprint: str,
+        created_at: datetime,
+    ) -> bool:
+        del reply_fingerprint, created_at
+        if conversation_key in self.first_contact:
+            return False
+        self.first_contact[conversation_key] = (reservation_id, "reserved")
+        return True
+
+    def release_first_contact_catalog_reservation(
+        self, conversation_key: str, *, reservation_id: str
+    ) -> None:
+        if self.first_contact.get(conversation_key) == (reservation_id, "reserved"):
+            self.first_contact.pop(conversation_key)
+
+    def mark_first_contact_catalog_sent(
+        self,
+        conversation_key: str,
+        *,
+        reservation_id: str,
+        updated_at: datetime,
+    ) -> None:
+        del updated_at
+        if self.first_contact.get(conversation_key) == (reservation_id, "reserved"):
+            self.first_contact[conversation_key] = (reservation_id, "sent")
+
     def get_media_asset(self, asset_id: str):
         return self.source.get_media_asset(asset_id)
+
+    def save_negotiation_state(
+        self, conversation_key: str, state: object, *, price_variant: str
+    ) -> None:
+        self.negotiation_states[conversation_key] = (state, price_variant)
+
+    def load_negotiation_state(self, conversation_key: str):
+        return self.negotiation_states.get(conversation_key)
+
+    def save_sales_state(self, state: SalesState) -> None:
+        self.sales_states[state.conversation_key] = state
+
+    def cancel_sales_follow_up(
+        self, conversation_key: str, *, updated_at: datetime
+    ) -> None:
+        del updated_at
+        self.sales_states.pop(conversation_key, None)
+
+    def list_due_sales_follow_ups(self, *, now: datetime, limit: int):
+        del now, limit
+        return []
+
+    def mark_sales_follow_up_sent(
+        self,
+        conversation_key: str,
+        *,
+        merchant_fingerprint: str,
+        updated_at: datetime,
+    ) -> None:
+        del conversation_key, merchant_fingerprint, updated_at
 
     def save_price_change_draft(self, draft: PriceChangeDraft) -> None:
         self.price_changes = [
             item for item in self.price_changes if item.task_id != draft.task_id
         ]
         self.price_changes.append(draft)
+
+    def list_price_change_drafts(self, limit: int = 100):
+        return self.price_changes[-limit:]
 
     def save_reply_draft(self, draft: ReplyDraft) -> None:
         self.drafts[draft.job_id] = draft
