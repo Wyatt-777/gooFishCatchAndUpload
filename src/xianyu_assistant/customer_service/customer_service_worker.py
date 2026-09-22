@@ -24,6 +24,8 @@ from xianyu_assistant.customer_service.current_catalog import (
     BLUETOOTH_UPGRADE_AMOUNT,
     CURRENT_CATALOG_REPLY,
     FIRST_CONTACT_CATALOG_REPLY,
+    FIRST_CONTACT_MESSAGE_SETTING,
+    MAX_FIRST_CONTACT_MESSAGE_LENGTH,
     NEGOTIATION_OPENING_COUNTERS,
 )
 from xianyu_assistant.customer_service.fingerprints import (
@@ -35,6 +37,9 @@ from xianyu_assistant.customer_service.models import (
     ChatMessage,
     ConversationSnapshot,
     ConversationSummary,
+    CustomerIntentLevel,
+    CustomerLifecycle,
+    CustomerOrderStatus,
     CustomerServiceConfig,
     HistoricalExample,
     ImagePayload,
@@ -115,6 +120,25 @@ _MISSING_PRODUCT_HANDOFF_MARKERS = (
     "冒烟",
     "鼓包",
     "受伤",
+)
+_AFTER_SALES_CUSTOMER_MARKERS = (
+    "退款",
+    "退货",
+    "售后",
+    "赔偿",
+    "质保",
+    "保修",
+    "容量不足",
+    "虚标",
+    "坏了",
+    "故障",
+    "不能用",
+)
+_ORDERED_CUSTOMER_MARKERS = (
+    "付款了",
+    "已付款",
+    "已经付款",
+    "付好了",
 )
 _BATTERY_VOLTAGE_RE = re.compile(r"(?<!\d)(48|60|72)\s*(?:v|伏)", re.IGNORECASE)
 _BATTERY_CAPACITY_RE = re.compile(
@@ -249,6 +273,7 @@ class _PendingJob:
     product_key: str | None = None
     conversation_version: int = 0
     first_contact_catalog: bool = False
+    first_contact_message: str | None = None
 
 
 @dataclass(slots=True)
@@ -349,6 +374,7 @@ class CustomerServiceWorker:
         self._negotiation_price_variants: dict[str, str] = {}
         self._consecutive_model_failures = 0
         self._consecutive_send_failures = 0
+        self._consecutive_page_health_failures = 0
 
     @property
     def status(self) -> ReceptionStatus:
@@ -362,6 +388,11 @@ class CustomerServiceWorker:
     @property
     def price_changes(self) -> PriceChangeDraftQueue:
         return self._price_changes
+
+    @property
+    def stop_reason(self) -> str | None:
+        """Return the redacted reason for the latest global stop or halt."""
+        return self._stop_reason
 
     def start(self) -> ReceptionStatus:
         """Create the app-owned page and enter RUNNING only if it is healthy."""
@@ -382,9 +413,17 @@ class CustomerServiceWorker:
             return self._status
         with self._lock:
             self._status = transition_reception(self._status, ReceptionStatus.RUNNING)
+        self._stop_reason = None
         self._stop_event.clear()
         self._consecutive_model_failures = 0
         self._consecutive_send_failures = 0
+        self._consecutive_page_health_failures = 0
+        recover = getattr(self._repository, "recover_interrupted_reply_jobs", None)
+        if callable(recover):
+            try:
+                recover(recovered_at=self._clock.now())
+            except Exception:  # recovery diagnostics must not block a safe start
+                logger.exception("中断任务恢复检查失败。")
         self._discard_stale_commands()
         return self._status
 
@@ -422,13 +461,36 @@ class CustomerServiceWorker:
         self._drain_commands()
         if self._stop_event.is_set():
             return 0
-        health = self._adapter.check_page_health()
-        if health.status is not PageHealthStatus.HEALTHY:
-            self._halt("客服页健康检查未通过。")
+        try:
+            health = self._adapter.check_page_health()
+        except Exception:  # noqa: BLE001 - bounded retry isolates browser transients
+            if self._record_page_failure("客服页健康检查异常"):
+                self._halt("客服页连续健康检查异常，已安全暂停。")
             return 0
-        summaries = self._adapter.list_changed_conversations(
-            self._config.max_conversations_per_poll
-        )
+        if health.status in {
+            PageHealthStatus.LOGIN_REQUIRED,
+            PageHealthStatus.CAPTCHA,
+            PageHealthStatus.RISK_CONTROL,
+        }:
+            self._halt(self._critical_page_health_reason(health.status))
+            return 0
+        if health.status is not PageHealthStatus.HEALTHY:
+            if self._record_page_failure(health.detail or health.status.value):
+                self._halt(
+                    f"客服页连续{self._consecutive_page_health_failures}次健康检查未通过："
+                    f"{health.detail or health.status.value}"
+                )
+            return 0
+        try:
+            summaries = self._adapter.list_changed_conversations(
+                self._config.max_conversations_per_poll
+            )
+        except Exception:
+            logger.exception("读取会话列表失败。")
+            if self._record_page_failure("读取会话列表失败"):
+                self._halt("连续读取会话列表失败，已安全暂停。")
+            return 0
+        self._consecutive_page_health_failures = 0
         selected = self._select_fair_batch(summaries)
         observed = 0
         for summary in selected:
@@ -558,6 +620,22 @@ class CustomerServiceWorker:
                 created_at=self._clock.now(),
             )
             return False
+        observe_customer = getattr(self._repository, "observe_customer_summary", None)
+        if callable(observe_customer):
+            try:
+                observe_customer(
+                    replace(
+                        summary,
+                        display_name=(
+                            self._redactor.redact(summary.display_name)
+                            if summary.display_name
+                            else None
+                        ),
+                    ),
+                    observed_at=self._clock.now(),
+                )
+            except Exception:  # noqa: BLE001 - CRM audit must not stop reception
+                logger.warning("顾客档案摘要保存失败。")
         if self._repository.has_open_handoff(summary.conversation_key):
             return False
         try:
@@ -565,10 +643,20 @@ class CustomerServiceWorker:
             snapshot = self._adapter.read_conversation()
         except Exception:  # noqa: BLE001 - browser errors must not stop fair scheduling
             return False
-        return self._register_snapshot(snapshot)
+        try:
+            return self._register_snapshot(snapshot)
+        except Exception as error:  # noqa: BLE001 - isolate one malformed conversation
+            self._isolate_conversation_failure(
+                conversation_key=summary.conversation_key,
+                error=error,
+                stage="登记顾客消息",
+            )
+            return False
 
     def _register_snapshot(self, snapshot: ConversationSnapshot) -> bool:
         if self._repository.has_open_handoff(snapshot.conversation_key):
+            return False
+        if self._intercept_post_fulfillment(snapshot):
             return False
         incoming = _incoming_tail(snapshot)
         if not incoming or not snapshot.last_message_from_customer:
@@ -609,6 +697,11 @@ class CustomerServiceWorker:
                 )
             except Exception:  # noqa: BLE001 - uncertain history must not repeat a greeting
                 logger.warning("首次会话目录状态读取失败；本轮不发送欢迎目录。")
+        first_contact_message = (
+            _configured_first_contact_message(self._repository)
+            if first_contact_catalog
+            else None
+        )
         observe_turn = getattr(self._repository, "observe_customer_turn", None)
         conversation_version = 0
         if callable(observe_turn):
@@ -648,6 +741,7 @@ class CustomerServiceWorker:
                 draft=persisted,
                 conversation_version=conversation_version,
                 first_contact_catalog=first_contact_catalog,
+                first_contact_message=first_contact_message,
             )
             self._jobs[resumed.job_id] = resumed
             self._job_by_conversation[resumed.conversation_key] = resumed.job_id
@@ -663,6 +757,7 @@ class CustomerServiceWorker:
             query_messages=query_messages,
             conversation_version=conversation_version,
             first_contact_catalog=first_contact_catalog,
+            first_contact_message=first_contact_message,
         )
         job = replace(job, status=transition_reply(job.status, ReplyJobStatus.DEBOUNCING))
         self._jobs[job.job_id] = job
@@ -677,7 +772,16 @@ class CustomerServiceWorker:
         for job in due_jobs:
             if self._stop_event.is_set():
                 return
-            self._generate_draft(job)
+            try:
+                self._generate_draft(job)
+            except Exception as error:  # noqa: BLE001 - isolate unexpected job defects
+                current = self._jobs.get(job.job_id, job)
+                self._isolate_conversation_failure(
+                    conversation_key=job.conversation_key,
+                    error=error,
+                    stage=_reply_stage_label(current.status),
+                    job=current,
+                )
 
     def _generate_draft(self, job: _PendingJob) -> None:
         try:
@@ -811,6 +915,7 @@ class CustomerServiceWorker:
                 context.query,
                 allow_catalog=job.first_contact_catalog or legacy_initial_catalog,
                 first_contact_exact=job.first_contact_catalog,
+                first_contact_message=job.first_contact_message,
             )
         job = self._set_status(job, ReplyJobStatus.GENERATING)
         if proposal is None:
@@ -925,7 +1030,10 @@ class CustomerServiceWorker:
         if job.first_contact_catalog:
             proposal = replace(
                 proposal,
-                reply_text=_prepend_first_contact_catalog(proposal.reply_text),
+                reply_text=_prepend_first_contact_catalog(
+                    proposal.reply_text,
+                    job.first_contact_message,
+                ),
             )
         job = replace(
             job,
@@ -940,6 +1048,13 @@ class CustomerServiceWorker:
                 media_asset_id=proposal.media_asset_id,
                 status=job.status,
             ),
+        )
+        self._record_customer_state(
+            job,
+            context=context,
+            proposal=proposal,
+            negotiation_plan=negotiation_plan,
+            sales_stage=sales_stage,
         )
         self._jobs[job.job_id] = job
         update_turn = getattr(self._repository, "update_customer_turn", None)
@@ -1114,6 +1229,12 @@ class CustomerServiceWorker:
             current = self._adapter.read_conversation()
         except Exception:  # noqa: BLE001 - all financial page failures fail closed
             return self._update_price_change(task, PriceChangeStatus.FAILED, "改价前无法重新读取会话。")
+        if self._intercept_post_fulfillment(current):
+            return self._update_price_change(
+                task,
+                PriceChangeStatus.SUPERSEDED,
+                "平台显示你已发货，已转人工并取消自动改价。",
+            )
         latest = current.last_incoming_message
         if latest is None or latest.message_key != task.customer_message_key:
             return self._update_price_change(
@@ -1227,7 +1348,10 @@ class CustomerServiceWorker:
         for message in messages:
             text = message.text or f"[{message.kind.value}]"
             if message.direction is MessageDirection.INCOMING and message.kind is MessageKind.VOICE:
-                transcript = self._adapter.request_voice_transcript(message.message_key)
+                try:
+                    transcript = self._adapter.request_voice_transcript(message.message_key)
+                except Exception as error:
+                    raise CustomerServiceWorkerError("顾客语音转写失败。") from error
                 text = transcript or "[语音未转写，需向顾客澄清]"
             elif message.direction is MessageDirection.INCOMING and message.kind is MessageKind.IMAGE:
                 if image is None:
@@ -1395,6 +1519,18 @@ class CustomerServiceWorker:
             self._fail(job, "发送前无法重新读取会话。")
             self._record_send_failure()
             return ApprovalResult(job.job_id, ReplyJobStatus.FAILED, False, "发送前读取会话失败。")
+        if self._intercept_post_fulfillment(current):
+            handoff = self._set_status(
+                job,
+                ReplyJobStatus.HANDOFF,
+                failure_reason="平台显示你已发货，已停止自动回复并转人工。",
+            )
+            return ApprovalResult(
+                job.job_id,
+                handoff.status,
+                False,
+                "订单已发货，当前消息已转人工。",
+            )
         current_fingerprint = _snapshot_batch_fingerprint(current)
         if current_fingerprint != job.batch_fingerprint or not current.last_message_from_customer:
             self._supersede(job)
@@ -1421,7 +1557,7 @@ class CustomerServiceWorker:
         )
         if (
             job.first_contact_catalog
-            and _contains_first_contact_catalog(send_text)
+            and _contains_first_contact_catalog(send_text, job.first_contact_message)
             and callable(reserve_first_contact)
         ):
             try:
@@ -1442,7 +1578,10 @@ class CustomerServiceWorker:
                     "首次会话目录状态无法确认。",
                 )
             if not first_contact_reserved:
-                send_text = _remove_first_contact_catalog(send_text)
+                send_text = _remove_first_contact_catalog(
+                    send_text,
+                    job.first_contact_message,
+                )
                 if not send_text:
                     self._supersede(job)
                     return ApprovalResult(
@@ -1534,12 +1673,16 @@ class CustomerServiceWorker:
                 handled_message_key=last_incoming.message_key,
                 updated_at=self._clock.now(),
             )
+        next_follow_up_at: datetime | None = None
         if (
             self._config.mode is ReceptionMode.AUTO_SEND
             and job.sales_follow_up_text
             and job.sales_stage is not SalesStage.PAUSED
         ):
             now = self._clock.now()
+            next_follow_up_at = now + timedelta(
+                minutes=self._config.sales_follow_up_delay_minutes
+            )
             incoming = job.snapshot.last_incoming_message
             try:
                 self._repository.save_sales_state(
@@ -1548,8 +1691,7 @@ class CustomerServiceWorker:
                         product_key=job.product_key,
                         stage=job.sales_stage,
                         follow_up_text=job.sales_follow_up_text,
-                        follow_up_due_at=now
-                        + timedelta(minutes=self._config.sales_follow_up_delay_minutes),
+                        follow_up_due_at=next_follow_up_at,
                         last_customer_message_key=(
                             incoming.message_key if incoming is not None else None
                         ),
@@ -1560,6 +1702,18 @@ class CustomerServiceWorker:
                 )
             except Exception:  # noqa: BLE001 - a sent reply must never be repeated for audit failure
                 logger.warning("销售追问状态保存失败；已发送回复不会重发。")
+        mark_customer_reply = getattr(self._repository, "mark_customer_reply_sent", None)
+        if callable(mark_customer_reply):
+            try:
+                mark_customer_reply(
+                    job.conversation_key,
+                    event_key=f"{job.batch_fingerprint}:merchant-reply",
+                    sales_stage=job.sales_stage,
+                    next_follow_up_at=next_follow_up_at,
+                    sent_at=self._clock.now(),
+                )
+            except Exception:  # noqa: BLE001 - verified sends are never repeated for CRM failure
+                logger.warning("顾客档案的商家回复状态保存失败。")
         if self._config.mode is ReceptionMode.HUMAN_CONFIRMATION:
             self._repository.save_human_confirmed_example(
                 HistoricalExample(
@@ -1643,6 +1797,69 @@ class CustomerServiceWorker:
             updated_at=self._clock.now(),
         )
 
+    def _record_customer_state(
+        self,
+        job: _PendingJob,
+        *,
+        context: _PromptContext,
+        proposal: ReplyProposal,
+        negotiation_plan: NegotiationPlan | None,
+        sales_stage: SalesStage,
+    ) -> None:
+        recorder = getattr(self._repository, "record_customer_state", None)
+        if not callable(recorder):
+            return
+        lifecycle, intent_level, order_status = _classify_customer_state(
+            context.query,
+            context.semantics,
+            proposal,
+            negotiation_plan,
+        )
+        quantity = (
+            negotiation_plan.quantity
+            if negotiation_plan is not None
+            else context.semantics.quantity
+        )
+        accepted_price = (
+            negotiation_plan.accepted_price
+            if negotiation_plan is not None
+            else proposal.offered_price
+        )
+        try:
+            recorder(
+                event_key=f"{job.batch_fingerprint}:classified",
+                conversation_key=job.conversation_key,
+                event_type="customer_turn_classified",
+                lifecycle=lifecycle,
+                intent_level=intent_level,
+                observed_at=self._clock.now(),
+                product_key=job.product_key,
+                platform_product_id=job.snapshot.platform_product_id,
+                sales_stage=sales_stage,
+                order_status=order_status,
+                automation_status=(
+                    "human_owned" if proposal.requires_handoff else None
+                ),
+                battery_model=context.semantics.battery_model,
+                required_range_km=context.semantics.required_range_km,
+                motor_power_w=context.semantics.motor_power_w,
+                quantity=quantity,
+                budget_amount=context.semantics.money_offer,
+                last_customer_offer=context.semantics.money_offer,
+                accepted_price=accepted_price,
+                payload={
+                    "primary_intent": context.semantics.primary_intent,
+                    "reply_intent": proposal.intent,
+                    "negotiation_outcome": (
+                        negotiation_plan.outcome
+                        if negotiation_plan is not None
+                        else None
+                    ),
+                },
+            )
+        except Exception:  # noqa: BLE001 - CRM audit must not stop a valid reply
+            logger.warning("顾客状态更新失败。")
+
     def _process_due_sales_follow_ups(self) -> None:
         """Send one persisted follow-up only when the customer stayed silent."""
         now = self._clock.now()
@@ -1669,6 +1886,12 @@ class CustomerServiceWorker:
             try:
                 self._adapter.open_conversation(state.conversation_key)
                 snapshot = self._adapter.read_conversation()
+                if self._intercept_post_fulfillment(snapshot):
+                    self._repository.cancel_sales_follow_up(
+                        state.conversation_key,
+                        updated_at=now,
+                    )
+                    continue
                 last_message = snapshot.last_message
                 if (
                     last_message is None
@@ -1706,6 +1929,99 @@ class CustomerServiceWorker:
                 merchant_fingerprint=receipt.content_fingerprint,
                 updated_at=now,
             )
+            mark_customer_reply = getattr(
+                self._repository, "mark_customer_reply_sent", None
+            )
+            if callable(mark_customer_reply):
+                try:
+                    mark_customer_reply(
+                        state.conversation_key,
+                        event_key=(
+                            f"sales-follow-up:{state.conversation_key}:"
+                            f"{state.last_customer_message_key or 'unknown'}"
+                        ),
+                        sales_stage=SalesStage.FOLLOWED_UP,
+                        next_follow_up_at=None,
+                        sent_at=now,
+                    )
+                except Exception:  # noqa: BLE001 - follow-up already verified
+                    logger.warning("顾客档案的追问发送状态保存失败。")
+
+    def _intercept_post_fulfillment(self, snapshot: ConversationSnapshot) -> bool:
+        """Persist trusted shipment evidence and stop automation before model/send."""
+        locked = False
+        if snapshot.order_shipped:
+            event = next(
+                item
+                for item in snapshot.system_events
+                if item.kind.value == "order_shipped"
+            )
+            recorder = getattr(
+                self._repository,
+                "record_shipped_conversation",
+                None,
+            )
+            if callable(recorder):
+                try:
+                    state = recorder(
+                        conversation_key=snapshot.conversation_key,
+                        platform_product_id=snapshot.platform_product_id,
+                        evidence_key=event.event_key,
+                        evidence_text=event.text,
+                        observed_at=self._clock.now(),
+                    )
+                    locked = state.automation_status == "human_owned"
+                except Exception:  # uncertain fulfillment state fails closed
+                    logger.exception("订单发货状态保存失败，已按人工接管处理。")
+                    locked = True
+            else:
+                locked = True
+        else:
+            checker = getattr(
+                self._repository,
+                "is_post_delivery_human_owned",
+                None,
+            )
+            if callable(checker):
+                try:
+                    locked = bool(checker(snapshot.conversation_key))
+                except Exception:  # a broken safety read must fail closed
+                    logger.exception("发货后人工锁读取失败，已按人工接管处理。")
+                    locked = True
+        if not locked:
+            return False
+
+        self._repository.cancel_sales_follow_up(
+            snapshot.conversation_key,
+            updated_at=self._clock.now(),
+        )
+        existing_job_id = self._job_by_conversation.get(snapshot.conversation_key)
+        if existing_job_id:
+            existing = self._jobs.get(existing_job_id)
+            if existing is not None:
+                self._supersede(existing)
+        if not snapshot.last_message_from_customer:
+            return True
+
+        fingerprint = _snapshot_batch_fingerprint(snapshot)
+        if self._repository.has_processed_fingerprint(fingerprint):
+            return True
+        reason = "平台显示你已发货，顾客新消息已停止自动回复，请人工处理。"
+        saver = getattr(self._repository, "save_post_delivery_handoff", None)
+        if callable(saver):
+            saver(
+                conversation_key=snapshot.conversation_key,
+                reason=reason,
+                created_at=self._clock.now(),
+            )
+        else:
+            self._repository.save_handoff_event(
+                conversation_key=snapshot.conversation_key,
+                reason=reason,
+                created_at=self._clock.now(),
+            )
+        self._repository.add_processed_fingerprint(fingerprint, self._clock.now())
+        return True
 
     def _record_model_failure(self) -> None:
         self._consecutive_model_failures += 1
@@ -1716,6 +2032,72 @@ class CustomerServiceWorker:
         self._consecutive_send_failures += 1
         if self._consecutive_send_failures >= self._config.max_send_failures:
             self._halt("发送连续失败，已安全暂停接待。")
+
+    def _record_page_failure(self, detail: str) -> bool:
+        """Count infrastructure failures separately from model/send failures."""
+        self._consecutive_page_health_failures += 1
+        logger.warning(
+            "客服页暂时不可用（%s/%s）：%s",
+            self._consecutive_page_health_failures,
+            self._config.max_page_health_failures,
+            self._redactor.redact(detail)[:240],
+        )
+        return (
+            self._consecutive_page_health_failures
+            >= self._config.max_page_health_failures
+        )
+
+    @staticmethod
+    def _critical_page_health_reason(status: PageHealthStatus) -> str:
+        return {
+            PageHealthStatus.LOGIN_REQUIRED: "闲鱼登录已失效，客服已暂停。",
+            PageHealthStatus.CAPTCHA: "闲鱼页面出现验证码，客服已暂停。",
+            PageHealthStatus.RISK_CONTROL: "闲鱼页面触发风控，客服已暂停。",
+        }.get(status, "客服页面处于不安全状态，客服已暂停。")
+
+    def _isolate_conversation_failure(
+        self,
+        *,
+        conversation_key: str,
+        error: Exception,
+        stage: str,
+        job: _PendingJob | None = None,
+    ) -> None:
+        """Turn one broken conversation over to a human and keep polling peers."""
+        safe_stage = self._redactor.redact(stage)[:80]
+        safe_type = error.__class__.__name__[:80]
+        reason = f"会话处理异常（{safe_stage}），已转人工；其他顾客继续接待。"
+        logger.exception(
+            "会话级故障已隔离 conversation=%s stage=%s exception=%s",
+            _safe_conversation_reference(conversation_key),
+            safe_stage,
+            safe_type,
+        )
+        if job is not None and job.status not in {
+            ReplyJobStatus.SENT,
+            ReplyJobStatus.HANDOFF,
+            ReplyJobStatus.SUPERSEDED,
+            ReplyJobStatus.FAILED,
+        }:
+            try:
+                self._fail(job, reason)
+            except Exception:
+                logger.exception("会话异常任务状态保存失败。")
+        try:
+            self._repository.save_handoff_event(
+                conversation_key=conversation_key,
+                reason=reason,
+                created_at=self._clock.now(),
+            )
+        except Exception:
+            logger.exception("会话异常转人工通知保存失败。")
+        try:
+            self._repository.cancel_sales_follow_up(
+                conversation_key,
+                updated_at=self._clock.now(),
+            )
+        except Exception:
+            logger.exception("会话异常后的销售追问取消失败。")
 
     def _halt(self, reason: str) -> None:
         self._stop_reason = reason
@@ -2103,6 +2485,7 @@ def _catalog_or_handoff_reply(
     *,
     allow_catalog: bool = True,
     first_contact_exact: bool = False,
+    first_contact_message: str | None = None,
 ) -> ReplyProposal | None:
     """Apply the user-approved catalog rule before invoking the model."""
     folded = normalize_for_matching(query)
@@ -2130,7 +2513,7 @@ def _catalog_or_handoff_reply(
     if allow_catalog and (not has_explicit_model or asks_price):
         return ReplyProposal(
             reply_text=(
-                FIRST_CONTACT_CATALOG_REPLY
+                (first_contact_message or FIRST_CONTACT_CATALOG_REPLY)
                 if first_contact_exact
                 else CURRENT_CATALOG_REPLY
             ),
@@ -2225,25 +2608,110 @@ def _display_price(value: str) -> str:
     return value[:-3] if value.endswith(".00") else value.rstrip("0").rstrip(".")
 
 
-def _contains_first_contact_catalog(text: str) -> bool:
-    return text == FIRST_CONTACT_CATALOG_REPLY or text.startswith(
-        FIRST_CONTACT_CATALOG_REPLY + "\n"
+def _classify_customer_state(
+    query: str,
+    semantics: CustomerSemantics,
+    proposal: ReplyProposal,
+    negotiation_plan: NegotiationPlan | None,
+) -> tuple[CustomerLifecycle, CustomerIntentLevel, CustomerOrderStatus]:
+    """Map only deterministic evidence into a durable CRM state."""
+    folded = normalize_for_matching(query)
+    if proposal.intent == "warranty" or any(
+        marker in folded for marker in _AFTER_SALES_CUSTOMER_MARKERS
+    ):
+        return (
+            CustomerLifecycle.AFTER_SALES,
+            CustomerIntentLevel.UNKNOWN,
+            CustomerOrderStatus.AFTER_SALES,
+        )
+    if any(marker in folded for marker in _ORDERED_CUSTOMER_MARKERS):
+        return (
+            CustomerLifecycle.ORDERED,
+            CustomerIntentLevel.HIGH,
+            CustomerOrderStatus.ORDERED,
+        )
+    if semantics.is_order_request:
+        return (
+            CustomerLifecycle.READY_TO_ORDER,
+            CustomerIntentLevel.HIGH,
+            (
+                CustomerOrderStatus.PENDING_PAYMENT
+                if negotiation_plan is not None
+                and negotiation_plan.outcome == "accept"
+                else CustomerOrderStatus.READY
+            ),
+        )
+    if negotiation_plan is not None or semantics.is_negotiation:
+        return (
+            CustomerLifecycle.NEGOTIATING,
+            (
+                CustomerIntentLevel.HIGH
+                if negotiation_plan is not None
+                and negotiation_plan.outcome == "accept"
+                else CustomerIntentLevel.MEDIUM
+            ),
+            CustomerOrderStatus.CONSIDERING,
+        )
+    if (
+        semantics.battery_model
+        or semantics.required_range_km
+        or semantics.motor_power_w
+    ):
+        return (
+            CustomerLifecycle.QUALIFIED,
+            CustomerIntentLevel.MEDIUM,
+            CustomerOrderStatus.CONSIDERING,
+        )
+    return (
+        CustomerLifecycle.ENGAGED,
+        CustomerIntentLevel.LOW,
+        CustomerOrderStatus.CONSIDERING,
     )
 
 
-def _prepend_first_contact_catalog(reply_text: str) -> str:
+def _configured_first_contact_message(repository: CustomerServiceRepository) -> str:
+    """Read the editable welcome text while preserving a safe non-empty fallback."""
+    get_setting = getattr(repository, "get_setting", None)
+    if not callable(get_setting):
+        return FIRST_CONTACT_CATALOG_REPLY
+    try:
+        configured = get_setting(
+            FIRST_CONTACT_MESSAGE_SETTING,
+            FIRST_CONTACT_CATALOG_REPLY,
+        )
+    except Exception:  # noqa: BLE001 - configuration failure must keep a safe default
+        logger.warning("首次会话话术读取失败；本轮使用默认话术。")
+        return FIRST_CONTACT_CATALOG_REPLY
+    normalized = str(configured or "").strip()
+    if not normalized or len(normalized) > MAX_FIRST_CONTACT_MESSAGE_LENGTH:
+        if normalized:
+            logger.warning("首次会话话术超过长度限制；本轮使用默认话术。")
+        return FIRST_CONTACT_CATALOG_REPLY
+    return normalized
+
+
+def _contains_first_contact_catalog(text: str, message: str | None = None) -> bool:
+    first_contact_message = (message or FIRST_CONTACT_CATALOG_REPLY).strip()
+    return text == first_contact_message or text.startswith(
+        first_contact_message + "\n"
+    )
+
+
+def _prepend_first_contact_catalog(reply_text: str, message: str | None = None) -> str:
+    first_contact_message = (message or FIRST_CONTACT_CATALOG_REPLY).strip()
     reply = reply_text.strip()
-    if _contains_first_contact_catalog(reply):
+    if _contains_first_contact_catalog(reply, first_contact_message):
         return reply
     if not reply:
-        return FIRST_CONTACT_CATALOG_REPLY
-    return f"{FIRST_CONTACT_CATALOG_REPLY}\n\n{reply}"
+        return first_contact_message
+    return f"{first_contact_message}\n\n{reply}"
 
 
-def _remove_first_contact_catalog(text: str) -> str:
-    if text == FIRST_CONTACT_CATALOG_REPLY:
+def _remove_first_contact_catalog(text: str, message: str | None = None) -> str:
+    first_contact_message = (message or FIRST_CONTACT_CATALOG_REPLY).strip()
+    if text == first_contact_message:
         return ""
-    prefix = FIRST_CONTACT_CATALOG_REPLY + "\n"
+    prefix = first_contact_message + "\n"
     return text[len(prefix) :].strip() if text.startswith(prefix) else text
 
 
@@ -2373,6 +2841,23 @@ def _current_operating_policy_reply(
     if "充电" in folded and any(marker in folded for marker in ("刚收到", "到货", "先")):
         return ReplyProposal(reply_text="到货先充满电 再装车", intent="first_use")
     return None
+
+
+def _reply_stage_label(status: ReplyJobStatus) -> str:
+    return {
+        ReplyJobStatus.DEBOUNCING: "等待合并消息",
+        ReplyJobStatus.READY: "准备生成回复",
+        ReplyJobStatus.READING_CONTEXT: "读取上下文",
+        ReplyJobStatus.GENERATING: "模型生成回复",
+        ReplyJobStatus.POLICY_CHECK: "回复安全检查",
+        ReplyJobStatus.SENDING: "发送回复",
+    }.get(status, "处理顾客消息")
+
+
+def _safe_conversation_reference(conversation_key: str) -> str:
+    """Keep logs correlatable without retaining a complete platform identifier."""
+    normalized = conversation_key.strip()
+    return f"…{normalized[-8:]}" if len(normalized) > 8 else normalized
 
 
 def _system_prompt() -> str:

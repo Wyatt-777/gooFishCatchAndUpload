@@ -12,7 +12,12 @@ from xianyu_assistant.customer_service.browser_adapter import (
     PlaywrightXianyuChatAdapter,
     ReadOnlyAdapterError,
 )
-from xianyu_assistant.customer_service.models import MessageKind, PageHealthStatus, SendReceipt
+from xianyu_assistant.customer_service.models import (
+    MessageKind,
+    PageHealthStatus,
+    PlatformSystemEventKind,
+    SendReceipt,
+)
 from xianyu_assistant.customer_service.protocols import TextSendNotPerformedError
 
 
@@ -166,6 +171,7 @@ class FakePage:
                 },
             ),
         ]
+        self.system_messages: list[FakeElement] = []
         self.product = FakeElement(
             {"data-product-id": "product-1", "data-product-title": "测试商品"}, "测试商品"
         )
@@ -225,6 +231,7 @@ class FakePage:
             ".conversation": FakeLocator(self.conversations),
             ".active": FakeLocator(self.conversations[:1]),
             ".message": FakeLocator(self.messages),
+            ".system-message": FakeLocator(self.system_messages),
             ".product-card": FakeLocator([self.product]),
             "#fixture-chat": FakeLocator([self.current]),
             ".editor": FakeLocator([self.editor]),
@@ -273,6 +280,7 @@ def _adapter(page: FakePage) -> PlaywrightXianyuChatAdapter:
             selectors=ChatPageSelectors(
                 conversation_items=".conversation",
                 message_items=".message",
+                system_message_items=".system-message",
                 text_selector=".message-text",
                 product_card=".product-card",
                 current_conversation_selector="#fixture-chat",
@@ -310,6 +318,30 @@ def test_read_only_adapter_reads_changed_conversations_messages_product_and_medi
     assert snapshot.messages[2].kind is MessageKind.IMAGE
     assert adapter.capture_incoming_image("message-3").content == b"fixture-image"
     assert adapter.request_voice_transcript("message-4") == "这是转写文本"
+
+
+def test_adapter_reads_fulfillment_platform_tips_separately_from_chat_messages() -> None:
+    page = FakePage()
+    page.system_messages = [
+        FakeElement({}, "订单已签收"),
+        FakeElement({}, "你已发货"),
+    ]
+    adapter = _adapter(page)
+    adapter.open_conversation("conversation-1")
+
+    snapshot = adapter.read_conversation()
+
+    assert snapshot.order_delivered is True
+    assert snapshot.order_shipped is True
+    assert len(snapshot.system_events) == 2
+    assert snapshot.system_events[0].kind is PlatformSystemEventKind.ORDER_DELIVERED
+    assert snapshot.system_events[0].text == "订单已签收"
+    assert snapshot.system_events[1].kind is PlatformSystemEventKind.ORDER_SHIPPED
+    assert snapshot.system_events[1].text == "你已发货"
+    assert all(
+        message.text not in {"订单已签收", "你已发货"}
+        for message in snapshot.messages
+    )
 
 
 def test_selected_conversation_is_polled_after_unread_badge_clears() -> None:
@@ -444,6 +476,7 @@ def test_real_price_change_selector_uses_semantic_header_not_volatile_topbar_has
     assert 'message-topbar--' not in selector
     assert confirmation == 'text=/您确定要修改价格吗[？?]?/'
     assert REAL_XIANYU_CHAT_CONTRACT.selectors.price_change_final_confirm_selector == 'text="确定"'
+    assert REAL_XIANYU_CHAT_CONTRACT.selectors.system_message_items == '[class^="msg-tips--"]'
 
 
 def test_unverified_contract_fails_closed_before_touching_page() -> None:

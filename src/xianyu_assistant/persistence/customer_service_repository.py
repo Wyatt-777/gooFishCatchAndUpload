@@ -17,8 +17,15 @@ from xianyu_assistant.customer_service.knowledge_importer import (
     CleanedKnowledgeDocument,
 )
 from xianyu_assistant.customer_service.models import (
+    ConversationFulfillmentState,
     ConversationSnapshot,
     ConversationSummary,
+    CustomerFulfillmentStatus,
+    CustomerIntentLevel,
+    CustomerLifecycle,
+    CustomerOrderStatus,
+    CustomerProfile,
+    CustomerStateEvent,
     HandoffEvent,
     HistoricalExample,
     MediaAsset,
@@ -175,6 +182,8 @@ class CustomerServiceRepository:
                     conversation_key TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    handoff_type TEXT NOT NULL DEFAULT 'general',
+                    release_on_resolve INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     content_expires_at TEXT NOT NULL
                 );
@@ -206,6 +215,10 @@ class CustomerServiceRepository:
                     started_at TEXT NOT NULL,
                     stopped_at TEXT,
                     stop_reason TEXT,
+                    failure_category TEXT,
+                    failure_stage TEXT,
+                    conversation_ref TEXT,
+                    exception_type TEXT,
                     content_expires_at TEXT NOT NULL
                 );
 
@@ -251,6 +264,18 @@ class CustomerServiceRepository:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS cs_conversation_fulfillment (
+                    conversation_key TEXT PRIMARY KEY,
+                    platform_product_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'unknown',
+                    evidence_key TEXT,
+                    evidence_text TEXT,
+                    shipped_at TEXT,
+                    delivered_at TEXT,
+                    automation_status TEXT NOT NULL DEFAULT 'active',
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS cs_customer_turns (
                     turn_id TEXT PRIMARY KEY,
                     conversation_key TEXT NOT NULL,
@@ -287,6 +312,59 @@ class CustomerServiceRepository:
                     reply_fingerprint TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cs_customers (
+                    customer_key TEXT PRIMARY KEY,
+                    platform_customer_id TEXT,
+                    primary_conversation_key TEXT NOT NULL,
+                    display_name TEXT,
+                    lifecycle TEXT NOT NULL DEFAULT 'new',
+                    intent_level TEXT NOT NULL DEFAULT 'unknown',
+                    sales_stage TEXT,
+                    order_status TEXT NOT NULL DEFAULT 'none',
+                    fulfillment_status TEXT NOT NULL DEFAULT 'unknown',
+                    shipped_at TEXT,
+                    delivered_at TEXT,
+                    automation_status TEXT NOT NULL DEFAULT 'active',
+                    current_product_key TEXT,
+                    platform_product_id TEXT,
+                    battery_model TEXT,
+                    required_range_km TEXT,
+                    motor_power_w TEXT,
+                    quantity INTEGER NOT NULL DEFAULT 1,
+                    budget_amount TEXT,
+                    last_customer_offer TEXT,
+                    accepted_price TEXT,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    last_customer_message_at TEXT,
+                    last_merchant_message_at TEXT,
+                    next_follow_up_at TEXT,
+                    conversation_count INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cs_customer_conversations (
+                    conversation_key TEXT PRIMARY KEY,
+                    customer_key TEXT NOT NULL REFERENCES cs_customers(customer_key) ON DELETE CASCADE,
+                    platform_product_id TEXT,
+                    linked_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cs_customer_state_events (
+                    event_key TEXT PRIMARY KEY,
+                    customer_key TEXT NOT NULL REFERENCES cs_customers(customer_key) ON DELETE CASCADE,
+                    conversation_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    from_lifecycle TEXT,
+                    to_lifecycle TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS cs_maintenance (
@@ -329,6 +407,45 @@ class CustomerServiceRepository:
                     ON cs_customer_turns(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_cs_send_outbox_updated
                     ON cs_send_outbox(updated_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_cs_customers_platform_id
+                    ON cs_customers(platform_customer_id)
+                    WHERE platform_customer_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_cs_customers_lifecycle
+                    ON cs_customers(lifecycle, intent_level, last_seen_at);
+                CREATE INDEX IF NOT EXISTS idx_cs_customers_follow_up
+                    ON cs_customers(next_follow_up_at)
+                    WHERE next_follow_up_at IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_cs_customer_events_customer
+                    ON cs_customer_state_events(customer_key, created_at);
+                CREATE INDEX IF NOT EXISTS idx_cs_fulfillment_automation
+                    ON cs_conversation_fulfillment(status, automation_status);
+                """
+            )
+            # Existing history is promoted into durable profiles without trying
+            # to merge identical display names.  The platform session id is the
+            # only stable identity currently exposed by the Xianyu page.
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customers (
+                    customer_key, primary_conversation_key, display_name,
+                    platform_product_id, first_seen_at, last_seen_at,
+                    created_at, updated_at
+                )
+                SELECT conversation_key, conversation_key, display_name,
+                       platform_product_id, updated_at, updated_at,
+                       updated_at, updated_at
+                FROM cs_conversations
+                """
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_conversations (
+                    conversation_key, customer_key, platform_product_id,
+                    linked_at, last_seen_at
+                )
+                SELECT conversation_key, conversation_key, platform_product_id,
+                       updated_at, updated_at
+                FROM cs_conversations
                 """
             )
             # Existing merchant replies mean this is not a first conversation.
@@ -379,12 +496,120 @@ class CustomerServiceRepository:
                 connection.execute(
                     "ALTER TABLE cs_price_change_tasks ADD COLUMN price_adjustment_amount TEXT"
                 )
+            handoff_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(cs_handoff_events)"
+                ).fetchall()
+            }
+            if "handoff_type" not in handoff_columns:
+                connection.execute(
+                    "ALTER TABLE cs_handoff_events "
+                    "ADD COLUMN handoff_type TEXT NOT NULL DEFAULT 'general'"
+                )
+            if "release_on_resolve" not in handoff_columns:
+                connection.execute(
+                    "ALTER TABLE cs_handoff_events "
+                    "ADD COLUMN release_on_resolve INTEGER NOT NULL DEFAULT 1"
+                )
+            customer_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(cs_customers)").fetchall()
+            }
+            if "fulfillment_status" not in customer_columns:
+                connection.execute(
+                    "ALTER TABLE cs_customers "
+                    "ADD COLUMN fulfillment_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
+            if "delivered_at" not in customer_columns:
+                connection.execute(
+                    "ALTER TABLE cs_customers ADD COLUMN delivered_at TEXT"
+                )
+            if "shipped_at" not in customer_columns:
+                connection.execute(
+                    "ALTER TABLE cs_customers ADD COLUMN shipped_at TEXT"
+                )
+            fulfillment_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(cs_conversation_fulfillment)"
+                ).fetchall()
+            }
+            if "shipped_at" not in fulfillment_columns:
+                connection.execute(
+                    "ALTER TABLE cs_conversation_fulfillment ADD COLUMN shipped_at TEXT"
+                )
+            run_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(cs_run_sessions)"
+                ).fetchall()
+            }
+            for column in (
+                "failure_category",
+                "failure_stage",
+                "conversation_ref",
+                "exception_type",
+            ):
+                if column not in run_columns:
+                    connection.execute(
+                        f"ALTER TABLE cs_run_sessions ADD COLUMN {column} TEXT"
+                    )
 
     def get_setting(self, name: str, default: str | None = None) -> str | None:
         """Read a non-secret application setting."""
         with self._connection() as connection:
             row = connection.execute("SELECT value FROM cs_settings WHERE name = ?", (name,)).fetchone()
         return default if row is None else str(row["value"])
+
+    def start_run_session(self, *, mode: str, started_at: datetime) -> int:
+        """Persist a privacy-safe reception run record for later diagnosis."""
+        started = _timestamp(started_at)
+        expires = _timestamp(started_at + timedelta(days=15))
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO cs_run_sessions (
+                    mode, status, started_at, content_expires_at
+                ) VALUES (?, 'running', ?, ?)
+                """,
+                (mode, started, expires),
+            )
+        return int(cursor.lastrowid)
+
+    def finish_run_session(
+        self,
+        run_id: int,
+        *,
+        status: str,
+        stopped_at: datetime,
+        stop_reason: str | None = None,
+        failure_category: str | None = None,
+        failure_stage: str | None = None,
+        conversation_ref: str | None = None,
+        exception_type: str | None = None,
+    ) -> None:
+        """Finish a reception run without storing chat text or credentials."""
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE cs_run_sessions
+                SET status = ?, stopped_at = ?, stop_reason = ?,
+                    failure_category = ?, failure_stage = ?,
+                    conversation_ref = ?, exception_type = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    _timestamp(stopped_at),
+                    (stop_reason or "")[:500] or None,
+                    (failure_category or "")[:80] or None,
+                    (failure_stage or "")[:80] or None,
+                    (conversation_ref or "")[:80] or None,
+                    (exception_type or "")[:80] or None,
+                    run_id,
+                ),
+            )
 
     def set_setting(self, name: str, value: str) -> None:
         """Persist a non-secret setting; callers must never pass API keys."""
@@ -401,6 +626,410 @@ class CustomerServiceRepository:
         """Remove one non-secret setting."""
         with self._connection() as connection:
             connection.execute("DELETE FROM cs_settings WHERE name = ?", (name,))
+
+    def observe_customer_summary(
+        self,
+        summary: ConversationSummary,
+        *,
+        observed_at: datetime,
+        platform_customer_id: str | None = None,
+    ) -> CustomerProfile:
+        """Create or refresh a durable customer profile from a chat-list row."""
+        now = _timestamp(observed_at)
+        with self._connection() as connection:
+            mapped = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (summary.conversation_key,),
+            ).fetchone()
+            if mapped is not None:
+                customer_key = str(mapped["customer_key"])
+            elif platform_customer_id:
+                existing = connection.execute(
+                    "SELECT customer_key FROM cs_customers WHERE platform_customer_id = ?",
+                    (platform_customer_id,),
+                ).fetchone()
+                customer_key = (
+                    str(existing["customer_key"])
+                    if existing is not None
+                    else f"customer-{platform_customer_id}"
+                )
+            else:
+                customer_key = summary.conversation_key
+
+            connection.execute(
+                """
+                INSERT INTO cs_customers (
+                    customer_key, platform_customer_id, primary_conversation_key,
+                    display_name, platform_product_id, first_seen_at, last_seen_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(customer_key) DO UPDATE SET
+                    platform_customer_id = COALESCE(
+                        excluded.platform_customer_id, cs_customers.platform_customer_id
+                    ),
+                    display_name = COALESCE(excluded.display_name, cs_customers.display_name),
+                    platform_product_id = COALESCE(
+                        excluded.platform_product_id, cs_customers.platform_product_id
+                    ),
+                    last_seen_at = excluded.last_seen_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    customer_key,
+                    platform_customer_id,
+                    summary.conversation_key,
+                    summary.display_name,
+                    summary.platform_product_id,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_customer_conversations (
+                    conversation_key, customer_key, platform_product_id,
+                    linked_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_key) DO UPDATE SET
+                    customer_key = excluded.customer_key,
+                    platform_product_id = COALESCE(
+                        excluded.platform_product_id,
+                        cs_customer_conversations.platform_product_id
+                    ),
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    summary.conversation_key,
+                    customer_key,
+                    summary.platform_product_id,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE cs_customers
+                SET conversation_count = (
+                    SELECT COUNT(*) FROM cs_customer_conversations
+                    WHERE customer_key = ?
+                )
+                WHERE customer_key = ?
+                """,
+                (customer_key, customer_key),
+            )
+            row = connection.execute(
+                "SELECT * FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("顾客档案写入后无法读取。")
+        return _customer_profile_from_row(row)
+
+    def record_customer_state(
+        self,
+        *,
+        event_key: str,
+        conversation_key: str,
+        event_type: str,
+        lifecycle: CustomerLifecycle,
+        intent_level: CustomerIntentLevel,
+        observed_at: datetime,
+        product_key: str | None = None,
+        platform_product_id: str | None = None,
+        sales_stage: SalesStage | None = None,
+        order_status: CustomerOrderStatus | None = None,
+        automation_status: str | None = None,
+        battery_model: str | None = None,
+        required_range_km: str | None = None,
+        motor_power_w: str | None = None,
+        quantity: int | None = None,
+        budget_amount: str | None = None,
+        last_customer_offer: str | None = None,
+        accepted_price: str | None = None,
+        next_follow_up_at: datetime | None = None,
+        clear_next_follow_up: bool = False,
+        payload: dict[str, object] | None = None,
+    ) -> CustomerProfile:
+        """Apply one idempotent deterministic state transition and audit it."""
+        if not event_key.strip() or not conversation_key.strip() or not event_type.strip():
+            raise ValueError("顾客状态事件缺少必要标识。")
+        if quantity is not None and quantity < 1:
+            raise ValueError("顾客意向数量必须大于零。")
+        now = _timestamp(observed_at)
+        with self._connection() as connection:
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            customer_key = (
+                str(mapping["customer_key"])
+                if mapping is not None
+                else conversation_key
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customers (
+                    customer_key, primary_conversation_key, platform_product_id,
+                    first_seen_at, last_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    customer_key,
+                    conversation_key,
+                    platform_product_id,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_conversations (
+                    conversation_key, customer_key, platform_product_id,
+                    linked_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (conversation_key, customer_key, platform_product_id, now, now),
+            )
+            duplicate = connection.execute(
+                "SELECT 1 FROM cs_customer_state_events WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+            current = connection.execute(
+                "SELECT * FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("找不到待更新的顾客档案。")
+            if duplicate is not None:
+                return _customer_profile_from_row(current)
+
+            current_lifecycle = CustomerLifecycle(str(current["lifecycle"]))
+            next_lifecycle = _advanced_customer_lifecycle(current_lifecycle, lifecycle)
+            current_intent = CustomerIntentLevel(str(current["intent_level"]))
+            next_intent = _stronger_customer_intent(current_intent, intent_level)
+            follow_up_value = (
+                None
+                if clear_next_follow_up
+                else (
+                    _timestamp(next_follow_up_at)
+                    if next_follow_up_at is not None
+                    else current["next_follow_up_at"]
+                )
+            )
+            connection.execute(
+                """
+                UPDATE cs_customers SET
+                    lifecycle = ?, intent_level = ?,
+                    sales_stage = COALESCE(?, sales_stage),
+                    order_status = COALESCE(?, order_status),
+                    automation_status = COALESCE(?, automation_status),
+                    current_product_key = COALESCE(?, current_product_key),
+                    platform_product_id = COALESCE(?, platform_product_id),
+                    battery_model = COALESCE(?, battery_model),
+                    required_range_km = COALESCE(?, required_range_km),
+                    motor_power_w = COALESCE(?, motor_power_w),
+                    quantity = COALESCE(?, quantity),
+                    budget_amount = COALESCE(?, budget_amount),
+                    last_customer_offer = COALESCE(?, last_customer_offer),
+                    accepted_price = COALESCE(?, accepted_price),
+                    last_seen_at = ?, last_customer_message_at = ?,
+                    next_follow_up_at = ?, updated_at = ?
+                WHERE customer_key = ?
+                """,
+                (
+                    next_lifecycle.value,
+                    next_intent.value,
+                    sales_stage.value if sales_stage is not None else None,
+                    order_status.value if order_status is not None else None,
+                    automation_status,
+                    product_key,
+                    platform_product_id,
+                    battery_model,
+                    required_range_km,
+                    motor_power_w,
+                    quantity,
+                    budget_amount,
+                    last_customer_offer,
+                    accepted_price,
+                    now,
+                    now,
+                    follow_up_value,
+                    now,
+                    customer_key,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_customer_state_events (
+                    event_key, customer_key, conversation_key, event_type,
+                    from_lifecycle, to_lifecycle, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    customer_key,
+                    conversation_key,
+                    event_type,
+                    current_lifecycle.value,
+                    next_lifecycle.value,
+                    json.dumps(payload or {}, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("顾客状态更新后无法读取。")
+        return _customer_profile_from_row(row)
+
+    def mark_customer_reply_sent(
+        self,
+        conversation_key: str,
+        *,
+        event_key: str,
+        sales_stage: SalesStage | None,
+        next_follow_up_at: datetime | None,
+        sent_at: datetime,
+    ) -> None:
+        """Record verified merchant activity without inventing customer intent."""
+        now = _timestamp(sent_at)
+        with self._connection() as connection:
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            customer_key = (
+                str(mapping["customer_key"])
+                if mapping is not None
+                else conversation_key
+            )
+            current = connection.execute(
+                "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+            if current is None:
+                return
+            if connection.execute(
+                "SELECT 1 FROM cs_customer_state_events WHERE event_key = ?",
+                (event_key,),
+            ).fetchone() is not None:
+                return
+            lifecycle = str(current["lifecycle"])
+            connection.execute(
+                """
+                UPDATE cs_customers SET
+                    sales_stage = COALESCE(?, sales_stage),
+                    last_seen_at = ?, last_merchant_message_at = ?,
+                    next_follow_up_at = ?, updated_at = ?
+                WHERE customer_key = ?
+                """,
+                (
+                    sales_stage.value if sales_stage is not None else None,
+                    now,
+                    now,
+                    _timestamp(next_follow_up_at) if next_follow_up_at else None,
+                    now,
+                    customer_key,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_customer_state_events (
+                    event_key, customer_key, conversation_key, event_type,
+                    from_lifecycle, to_lifecycle, payload_json, created_at
+                ) VALUES (?, ?, ?, 'merchant_reply_sent', ?, ?, '{}', ?)
+                """,
+                (event_key, customer_key, conversation_key, lifecycle, lifecycle, now),
+            )
+
+    def get_customer_profile(self, customer_key: str) -> CustomerProfile | None:
+        """Read one durable customer profile."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+        return None if row is None else _customer_profile_from_row(row)
+
+    def find_customer_profile_by_conversation(
+        self, conversation_key: str
+    ) -> CustomerProfile | None:
+        """Resolve one conversation to its durable customer profile."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT customer.* FROM cs_customers AS customer
+                JOIN cs_customer_conversations AS link
+                  ON link.customer_key = customer.customer_key
+                WHERE link.conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+        return None if row is None else _customer_profile_from_row(row)
+
+    def list_customer_profiles(self, limit: int = 100) -> list[CustomerProfile]:
+        """List recently active durable profiles for a future CRM view."""
+        if limit <= 0:
+            return []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM cs_customers
+                ORDER BY last_seen_at DESC, customer_key
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_customer_profile_from_row(row) for row in rows]
+
+    def list_customer_state_events(
+        self, customer_key: str, *, limit: int = 100
+    ) -> list[CustomerStateEvent]:
+        """List the newest state transitions for one customer."""
+        if limit <= 0:
+            return []
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM cs_customer_state_events
+                WHERE customer_key = ?
+                ORDER BY created_at DESC, event_key DESC
+                LIMIT ?
+                """,
+                (customer_key, limit),
+            ).fetchall()
+        return [
+            CustomerStateEvent(
+                event_key=str(row["event_key"]),
+                customer_key=str(row["customer_key"]),
+                conversation_key=str(row["conversation_key"]),
+                event_type=str(row["event_type"]),
+                from_lifecycle=(
+                    CustomerLifecycle(str(row["from_lifecycle"]))
+                    if row["from_lifecycle"] is not None
+                    else None
+                ),
+                to_lifecycle=CustomerLifecycle(str(row["to_lifecycle"])),
+                payload_json=str(row["payload_json"]),
+                created_at=_parse_or_now(str(row["created_at"])),
+            )
+            for row in rows
+        ]
 
     def should_send_first_contact_catalog(
         self,
@@ -768,6 +1397,7 @@ class CustomerServiceRepository:
 
     def cancel_sales_follow_up(self, conversation_key: str, *, updated_at: datetime) -> None:
         """Cancel only a still-pending follow-up; completed history remains auditable."""
+        now = _timestamp(updated_at)
         with self._connection() as connection:
             connection.execute(
                 """
@@ -776,7 +1406,18 @@ class CustomerServiceRepository:
                     follow_up_due_at = NULL, updated_at = ?
                 WHERE conversation_key = ? AND status = 'pending'
                 """,
-                (_timestamp(updated_at), conversation_key),
+                (now, conversation_key),
+            )
+            connection.execute(
+                """
+                UPDATE cs_customers
+                SET next_follow_up_at = NULL, updated_at = ?
+                WHERE customer_key = (
+                    SELECT customer_key FROM cs_customer_conversations
+                    WHERE conversation_key = ?
+                )
+                """,
+                (now, conversation_key),
             )
 
     def list_due_sales_follow_ups(
@@ -1437,6 +2078,15 @@ class CustomerServiceRepository:
                         observed_at,
                     ),
                 )
+        self.observe_customer_summary(
+            ConversationSummary(
+                conversation_key=snapshot.conversation_key,
+                display_name=display_name,
+                platform_product_id=snapshot.platform_product_id,
+                product_title=snapshot.product_title,
+            ),
+            observed_at=_parse_or_now(observed_at),
+        )
         return len(snapshot.messages)
 
     def store_live_summary(self, summary: ConversationSummary) -> None:
@@ -1463,6 +2113,10 @@ class CustomerServiceRepository:
                     expires_at,
                 ),
             )
+        self.observe_customer_summary(
+            summary,
+            observed_at=_parse_or_now(now),
+        )
 
     def list_historical_examples(self, *, limit: int | None = None) -> list[HistoricalExample]:
         """Load only persisted examples; auto-generated rows are excluded."""
@@ -1867,6 +2521,66 @@ class CustomerServiceRepository:
             failure_reason=row["failure_reason"],
         )
 
+    def recover_interrupted_reply_jobs(self, *, recovered_at: datetime) -> int:
+        """Close abandoned pipeline states without retrying an uncertain send."""
+        now = _timestamp(recovered_at)
+        expires_at = _timestamp(recovered_at + timedelta(days=15))
+        recoverable = (
+            ReplyJobStatus.DEBOUNCING.value,
+            ReplyJobStatus.READY.value,
+            ReplyJobStatus.READING_CONTEXT.value,
+            ReplyJobStatus.GENERATING.value,
+            ReplyJobStatus.POLICY_CHECK.value,
+        )
+        placeholders = ",".join("?" for _ in recoverable)
+        with self._connection() as connection:
+            interrupted = connection.execute(
+                f"""
+                UPDATE cs_reply_jobs
+                SET status = 'failed',
+                    failure_reason = '程序上次运行中断，已安全重新排队。',
+                    updated_at = ?
+                WHERE status IN ({placeholders})
+                """,
+                (now, *recoverable),
+            )
+            uncertain_rows = connection.execute(
+                "SELECT conversation_key FROM cs_reply_jobs WHERE status = 'sending'"
+            ).fetchall()
+            sending = connection.execute(
+                """
+                UPDATE cs_reply_jobs
+                SET status = 'handoff',
+                    failure_reason = '程序在发送确认阶段中断，禁止自动重发，请人工核对。',
+                    updated_at = ?
+                WHERE status = 'sending'
+                """,
+                (now,),
+            )
+            for row in uncertain_rows:
+                conversation_key = str(row["conversation_key"])
+                connection.execute(
+                    """
+                    INSERT INTO cs_handoff_events (
+                        conversation_key, reason, status, handoff_type,
+                        release_on_resolve, created_at, content_expires_at
+                    )
+                    SELECT ?, ?, 'open', 'general', 1, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM cs_handoff_events
+                        WHERE conversation_key = ? AND status = 'open'
+                    )
+                    """,
+                    (
+                        conversation_key,
+                        "程序在发送确认阶段中断，禁止自动重发，请人工核对。",
+                        now,
+                        expires_at,
+                        conversation_key,
+                    ),
+                )
+        return interrupted.rowcount + sending.rowcount
+
     def has_prior_reply_job(self, conversation_key: str, *, exclude_job_id: str) -> bool:
         """Check whether a conversation has already reached an earlier question batch."""
         with self._connection() as connection:
@@ -1880,30 +2594,521 @@ class CustomerServiceRepository:
             ).fetchone()
         return row is not None
 
+    def record_shipped_conversation(
+        self,
+        *,
+        conversation_key: str,
+        platform_product_id: str | None,
+        evidence_key: str,
+        evidence_text: str,
+        observed_at: datetime,
+    ) -> ConversationFulfillmentState:
+        """Persist platform-confirmed shipment and apply a sticky human lock."""
+        now = _timestamp(observed_at)
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM cs_conversation_fulfillment WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+            same_restored_event = bool(
+                existing is not None
+                and str(existing["status"]) == CustomerFulfillmentStatus.SHIPPED.value
+                and str(existing["evidence_key"] or "") == evidence_key
+            )
+            automation_status = (
+                str(existing["automation_status"])
+                if same_restored_event
+                else "human_owned"
+            )
+            shipped_at = (
+                str(existing["shipped_at"])
+                if existing is not None and existing["shipped_at"] is not None
+                else now
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_conversation_fulfillment (
+                    conversation_key, platform_product_id, status,
+                    evidence_key, evidence_text, shipped_at,
+                    automation_status, updated_at
+                ) VALUES (?, ?, 'shipped', ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_key) DO UPDATE SET
+                    platform_product_id = COALESCE(
+                        excluded.platform_product_id,
+                        cs_conversation_fulfillment.platform_product_id
+                    ),
+                    status = CASE
+                        WHEN cs_conversation_fulfillment.status = 'delivered'
+                        THEN 'delivered' ELSE 'shipped' END,
+                    evidence_key = excluded.evidence_key,
+                    evidence_text = excluded.evidence_text,
+                    shipped_at = COALESCE(
+                        cs_conversation_fulfillment.shipped_at,
+                        excluded.shipped_at
+                    ),
+                    automation_status = ?,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_key,
+                    platform_product_id,
+                    evidence_key,
+                    evidence_text,
+                    shipped_at,
+                    automation_status,
+                    now,
+                    automation_status,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_conversation_states (
+                    conversation_key, platform_product_id, human_owned, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_key) DO UPDATE SET
+                    platform_product_id = COALESCE(
+                        excluded.platform_product_id,
+                        cs_conversation_states.platform_product_id
+                    ),
+                    human_owned = excluded.human_owned,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_key,
+                    platform_product_id,
+                    1 if automation_status == "human_owned" else 0,
+                    now,
+                ),
+            )
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            customer_key = (
+                str(mapping["customer_key"])
+                if mapping is not None
+                else conversation_key
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customers (
+                    customer_key, primary_conversation_key, platform_product_id,
+                    first_seen_at, last_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    customer_key,
+                    conversation_key,
+                    platform_product_id,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_conversations (
+                    conversation_key, customer_key, platform_product_id,
+                    linked_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (conversation_key, customer_key, platform_product_id, now, now),
+            )
+            connection.execute(
+                """
+                UPDATE cs_customers
+                SET fulfillment_status = CASE
+                        WHEN fulfillment_status = 'delivered'
+                        THEN 'delivered' ELSE 'shipped' END,
+                    shipped_at = COALESCE(shipped_at, ?),
+                    last_seen_at = ?, updated_at = ?
+                WHERE customer_key = ?
+                """,
+                (shipped_at, now, now, customer_key),
+            )
+            lifecycle_row = connection.execute(
+                "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+            lifecycle = (
+                str(lifecycle_row["lifecycle"])
+                if lifecycle_row is not None
+                else CustomerLifecycle.NEW.value
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_state_events (
+                    event_key, customer_key, conversation_key, event_type,
+                    from_lifecycle, to_lifecycle, payload_json, created_at
+                ) VALUES (?, ?, ?, 'platform_order_shipped', ?, ?, ?, ?)
+                """,
+                (
+                    f"shipment:{evidence_key}",
+                    customer_key,
+                    conversation_key,
+                    lifecycle,
+                    lifecycle,
+                    json.dumps(
+                        {
+                            "platform_product_id": platform_product_id,
+                            "evidence_text": evidence_text,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM cs_conversation_fulfillment WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("发货状态写入后无法读取。")
+        return _fulfillment_state_from_row(row)
+
+    def record_delivered_conversation(
+        self,
+        *,
+        conversation_key: str,
+        platform_product_id: str | None,
+        evidence_key: str,
+        evidence_text: str,
+        observed_at: datetime,
+    ) -> ConversationFulfillmentState:
+        """Persist one platform-confirmed delivery and apply a conversation lock."""
+        now = _timestamp(observed_at)
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT * FROM cs_conversation_fulfillment WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+            automation_status = (
+                str(existing["automation_status"])
+                if existing is not None
+                and str(existing["status"]) == CustomerFulfillmentStatus.DELIVERED.value
+                and str(existing["evidence_key"] or "") == evidence_key
+                else "human_owned"
+            )
+            delivered_at = (
+                str(existing["delivered_at"])
+                if existing is not None and existing["delivered_at"] is not None
+                else now
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_conversation_fulfillment (
+                    conversation_key, platform_product_id, status,
+                    evidence_key, evidence_text, delivered_at,
+                    automation_status, updated_at
+                ) VALUES (?, ?, 'delivered', ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_key) DO UPDATE SET
+                    platform_product_id = COALESCE(
+                        excluded.platform_product_id,
+                        cs_conversation_fulfillment.platform_product_id
+                    ),
+                    status = 'delivered',
+                    evidence_key = excluded.evidence_key,
+                    evidence_text = excluded.evidence_text,
+                    delivered_at = COALESCE(
+                        cs_conversation_fulfillment.delivered_at,
+                        excluded.delivered_at
+                    ),
+                    automation_status = ?,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_key,
+                    platform_product_id,
+                    evidence_key,
+                    evidence_text,
+                    delivered_at,
+                    automation_status,
+                    now,
+                    automation_status,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO cs_conversation_states (
+                    conversation_key, platform_product_id, human_owned, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_key) DO UPDATE SET
+                    platform_product_id = COALESCE(
+                        excluded.platform_product_id,
+                        cs_conversation_states.platform_product_id
+                    ),
+                    human_owned = excluded.human_owned,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_key,
+                    platform_product_id,
+                    1 if automation_status == "human_owned" else 0,
+                    now,
+                ),
+            )
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            customer_key = (
+                str(mapping["customer_key"])
+                if mapping is not None
+                else conversation_key
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customers (
+                    customer_key, primary_conversation_key, platform_product_id,
+                    first_seen_at, last_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    customer_key,
+                    conversation_key,
+                    platform_product_id,
+                    now,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_conversations (
+                    conversation_key, customer_key, platform_product_id,
+                    linked_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (conversation_key, customer_key, platform_product_id, now, now),
+            )
+            connection.execute(
+                """
+                UPDATE cs_customers
+                SET fulfillment_status = 'delivered',
+                    delivered_at = COALESCE(delivered_at, ?),
+                    last_seen_at = ?, updated_at = ?
+                WHERE customer_key = ?
+                """,
+                (delivered_at, now, now, customer_key),
+            )
+            lifecycle_row = connection.execute(
+                "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+            lifecycle = (
+                str(lifecycle_row["lifecycle"])
+                if lifecycle_row is not None
+                else CustomerLifecycle.NEW.value
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_state_events (
+                    event_key, customer_key, conversation_key, event_type,
+                    from_lifecycle, to_lifecycle, payload_json, created_at
+                ) VALUES (?, ?, ?, 'platform_order_delivered', ?, ?, ?, ?)
+                """,
+                (
+                    f"delivery:{evidence_key}",
+                    customer_key,
+                    conversation_key,
+                    lifecycle,
+                    lifecycle,
+                    json.dumps(
+                        {
+                            "platform_product_id": platform_product_id,
+                            "evidence_text": evidence_text,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM cs_conversation_fulfillment WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("签收状态写入后无法读取。")
+        return _fulfillment_state_from_row(row)
+
+    def get_conversation_fulfillment(
+        self, conversation_key: str
+    ) -> ConversationFulfillmentState | None:
+        """Read durable fulfillment state for one order conversation."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM cs_conversation_fulfillment WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+        return _fulfillment_state_from_row(row) if row is not None else None
+
+    def is_post_delivery_human_owned(self, conversation_key: str) -> bool:
+        """Return whether a shipped or delivered order remains human-owned."""
+        state = self.get_conversation_fulfillment(conversation_key)
+        return bool(
+            state is not None
+            and state.status
+            in {
+                CustomerFulfillmentStatus.SHIPPED,
+                CustomerFulfillmentStatus.DELIVERED,
+            }
+            and state.automation_status == "human_owned"
+        )
+
     def save_handoff_event(
-        self, *, conversation_key: str, reason: str, created_at: datetime
+        self,
+        *,
+        conversation_key: str,
+        reason: str,
+        created_at: datetime,
+        handoff_type: str = "general",
+        release_on_resolve: bool = True,
     ) -> None:
         """Persist one open in-app notification per conversation."""
+        if handoff_type not in {"general", "post_delivery"}:
+            raise ValueError("转人工通知类型无效。")
         expires_at = _timestamp(created_at + timedelta(days=15))
         with self._connection() as connection:
             existing = connection.execute(
                 """
                 SELECT id FROM cs_handoff_events
-                WHERE conversation_key = ? AND status = 'open'
+                WHERE conversation_key = ?
+                  AND (
+                    status = 'open'
+                    OR (? = 'post_delivery' AND handoff_type = 'post_delivery')
+                  )
+                ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, id DESC
                 LIMIT 1
+                """,
+                (conversation_key, handoff_type),
+            ).fetchone()
+            if existing is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO cs_handoff_events (
+                        conversation_key, reason, status, handoff_type,
+                        release_on_resolve, created_at, content_expires_at
+                    ) VALUES (?, ?, 'open', ?, ?, ?, ?)
+                    """,
+                    (
+                        conversation_key,
+                        reason,
+                        handoff_type,
+                        int(release_on_resolve),
+                        _timestamp(created_at),
+                        expires_at,
+                    ),
+                )
+                handoff_id = int(cursor.lastrowid)
+            else:
+                handoff_id = int(existing["id"])
+                if handoff_type == "post_delivery":
+                    connection.execute(
+                        """
+                        UPDATE cs_handoff_events
+                        SET reason = ?, status = 'open', created_at = ?,
+                            content_expires_at = ?
+                        WHERE id = ?
+                        """,
+                        (reason, _timestamp(created_at), expires_at, handoff_id),
+                    )
+            now = _timestamp(created_at)
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
                 """,
                 (conversation_key,),
             ).fetchone()
-            if existing is not None:
-                return
+            customer_key = (
+                str(mapping["customer_key"])
+                if mapping is not None
+                else conversation_key
+            )
             connection.execute(
                 """
-                INSERT INTO cs_handoff_events (
-                    conversation_key, reason, status, created_at, content_expires_at
-                ) VALUES (?, ?, 'open', ?, ?)
+                INSERT OR IGNORE INTO cs_customers (
+                    customer_key, primary_conversation_key,
+                    first_seen_at, last_seen_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (conversation_key, reason, _timestamp(created_at), expires_at),
+                (customer_key, conversation_key, now, now, now, now),
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_conversations (
+                    conversation_key, customer_key, linked_at, last_seen_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (conversation_key, customer_key, now, now),
+            )
+            lifecycle_row = connection.execute(
+                "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
+                (customer_key,),
+            ).fetchone()
+            lifecycle = (
+                str(lifecycle_row["lifecycle"])
+                if lifecycle_row is not None
+                else CustomerLifecycle.NEW.value
+            )
+            if release_on_resolve:
+                connection.execute(
+                    """
+                    UPDATE cs_customers
+                    SET automation_status = 'human_owned', next_follow_up_at = NULL,
+                        last_seen_at = ?, updated_at = ?
+                    WHERE customer_key = ?
+                    """,
+                    (now, now, customer_key),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE cs_customers
+                    SET next_follow_up_at = NULL, last_seen_at = ?, updated_at = ?
+                    WHERE customer_key = ?
+                    """,
+                    (now, now, customer_key),
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO cs_customer_state_events (
+                    event_key, customer_key, conversation_key, event_type,
+                    from_lifecycle, to_lifecycle, payload_json, created_at
+                ) VALUES (?, ?, ?, 'handoff_opened', ?, ?, ?, ?)
+                """,
+                (
+                    f"handoff:{handoff_id}:opened",
+                    customer_key,
+                    conversation_key,
+                    lifecycle,
+                    lifecycle,
+                    json.dumps({"reason": reason}, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+
+    def save_post_delivery_handoff(
+        self, *, conversation_key: str, reason: str, created_at: datetime
+    ) -> None:
+        """Create a notification which does not release the delivery lock when closed."""
+        self.save_handoff_event(
+            conversation_key=conversation_key,
+            reason=reason,
+            created_at=created_at,
+            handoff_type="post_delivery",
+            release_on_resolve=False,
+        )
 
     def has_open_handoff(self, conversation_key: str) -> bool:
         """Check whether this conversation is isolated for human handling."""
@@ -1925,9 +3130,19 @@ class CustomerServiceRepository:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id, conversation_key, reason, status, created_at
+                SELECT id, conversation_key, reason, status, handoff_type,
+                       release_on_resolve, created_at
                 FROM cs_handoff_events
                 WHERE status = 'open'
+                   OR (
+                        handoff_type = 'post_delivery'
+                        AND EXISTS (
+                            SELECT 1 FROM cs_conversation_fulfillment AS fulfillment
+                            WHERE fulfillment.conversation_key = cs_handoff_events.conversation_key
+                              AND fulfillment.status IN ('shipped', 'delivered')
+                              AND fulfillment.automation_status = 'human_owned'
+                        )
+                   )
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
                 """,
@@ -1940,6 +3155,8 @@ class CustomerServiceRepository:
                 reason=str(row["reason"]),
                 status=str(row["status"]),
                 created_at=_parse_or_now(str(row["created_at"])),
+                handoff_type=str(row["handoff_type"]),
+                release_on_resolve=bool(row["release_on_resolve"]),
             )
             for row in rows
         ]
@@ -1947,6 +3164,15 @@ class CustomerServiceRepository:
     def resolve_handoff_event(self, event_id: int) -> bool:
         """Release a conversation only after the notification is handled."""
         with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT conversation_key, release_on_resolve FROM cs_handoff_events
+                WHERE id = ? AND status = 'open'
+                """,
+                (event_id,),
+            ).fetchone()
+            if existing is None:
+                return False
             cursor = connection.execute(
                 """
                 UPDATE cs_handoff_events
@@ -1955,7 +3181,133 @@ class CustomerServiceRepository:
                 """,
                 (event_id,),
             )
+            conversation_key = str(existing["conversation_key"])
+            release_on_resolve = bool(existing["release_on_resolve"])
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            if mapping is not None and release_on_resolve:
+                customer_key = str(mapping["customer_key"])
+                lifecycle_row = connection.execute(
+                    "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
+                    (customer_key,),
+                ).fetchone()
+                if lifecycle_row is not None:
+                    lifecycle = str(lifecycle_row["lifecycle"])
+                    now = _timestamp()
+                    connection.execute(
+                        """
+                        UPDATE cs_customers
+                        SET automation_status = 'active', updated_at = ?
+                        WHERE customer_key = ?
+                        """,
+                        (now, customer_key),
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO cs_customer_state_events (
+                            event_key, customer_key, conversation_key, event_type,
+                            from_lifecycle, to_lifecycle, payload_json, created_at
+                        ) VALUES (?, ?, ?, 'handoff_resolved', ?, ?, '{}', ?)
+                        """,
+                        (
+                            f"handoff:{event_id}:resolved",
+                            customer_key,
+                            conversation_key,
+                            lifecycle,
+                            lifecycle,
+                            now,
+                        ),
+                    )
         return cursor.rowcount == 1
+
+    def restore_conversation_automation(
+        self, conversation_key: str, *, restored_at: datetime
+    ) -> bool:
+        """Explicitly release a post-shipment lock for exactly one conversation."""
+        now = _timestamp(restored_at)
+        with self._connection() as connection:
+            current = connection.execute(
+                """
+                SELECT status, automation_status
+                FROM cs_conversation_fulfillment
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            if (
+                current is None
+                or str(current["status"])
+                not in {
+                    CustomerFulfillmentStatus.SHIPPED.value,
+                    CustomerFulfillmentStatus.DELIVERED.value,
+                }
+                or str(current["automation_status"]) != "human_owned"
+            ):
+                return False
+            connection.execute(
+                """
+                UPDATE cs_conversation_fulfillment
+                SET automation_status = 'active', updated_at = ?
+                WHERE conversation_key = ?
+                """,
+                (now, conversation_key),
+            )
+            connection.execute(
+                """
+                UPDATE cs_conversation_states
+                SET human_owned = 0, updated_at = ?
+                WHERE conversation_key = ?
+                """,
+                (now, conversation_key),
+            )
+            connection.execute(
+                """
+                UPDATE cs_handoff_events
+                SET status = 'resolved'
+                WHERE conversation_key = ?
+                  AND handoff_type = 'post_delivery'
+                  AND status = 'open'
+                """,
+                (conversation_key,),
+            )
+            mapping = connection.execute(
+                """
+                SELECT customer_key FROM cs_customer_conversations
+                WHERE conversation_key = ?
+                """,
+                (conversation_key,),
+            ).fetchone()
+            if mapping is not None:
+                customer_key = str(mapping["customer_key"])
+                lifecycle_row = connection.execute(
+                    "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
+                    (customer_key,),
+                ).fetchone()
+                if lifecycle_row is not None:
+                    lifecycle = str(lifecycle_row["lifecycle"])
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO cs_customer_state_events (
+                            event_key, customer_key, conversation_key, event_type,
+                            from_lifecycle, to_lifecycle, payload_json, created_at
+                        ) VALUES (?, ?, ?, 'post_delivery_automation_restored',
+                                  ?, ?, '{}', ?)
+                        """,
+                        (
+                            f"delivery:{conversation_key}:restored:{now}",
+                            customer_key,
+                            conversation_key,
+                            lifecycle,
+                            lifecycle,
+                            now,
+                        ),
+                    )
+        return True
 
     def has_processed_fingerprint(self, batch_fingerprint: str) -> bool:
         """Check the permanent duplicate-send guard."""
@@ -2176,3 +3528,132 @@ def _parse_or_now(value: str) -> datetime:
         return datetime.fromisoformat(value)
     except ValueError:
         return datetime.now().astimezone()
+
+
+def _parse_optional_timestamp(value: object) -> datetime | None:
+    return _parse_or_now(str(value)) if value is not None else None
+
+
+def _advanced_customer_lifecycle(
+    current: CustomerLifecycle,
+    candidate: CustomerLifecycle,
+) -> CustomerLifecycle:
+    """Advance normal sales states while allowing a lost customer to re-engage."""
+    if candidate in {CustomerLifecycle.AFTER_SALES, CustomerLifecycle.LOST}:
+        return candidate
+    if current is CustomerLifecycle.AFTER_SALES:
+        return current
+    if current is CustomerLifecycle.LOST:
+        return candidate
+    rank = {
+        CustomerLifecycle.NEW: 0,
+        CustomerLifecycle.ENGAGED: 1,
+        CustomerLifecycle.QUALIFIED: 2,
+        CustomerLifecycle.NEGOTIATING: 3,
+        CustomerLifecycle.READY_TO_ORDER: 4,
+        CustomerLifecycle.ORDERED: 5,
+    }
+    return candidate if rank.get(candidate, 0) >= rank.get(current, 0) else current
+
+
+def _stronger_customer_intent(
+    current: CustomerIntentLevel,
+    candidate: CustomerIntentLevel,
+) -> CustomerIntentLevel:
+    rank = {
+        CustomerIntentLevel.UNKNOWN: 0,
+        CustomerIntentLevel.LOW: 1,
+        CustomerIntentLevel.MEDIUM: 2,
+        CustomerIntentLevel.HIGH: 3,
+    }
+    return candidate if rank[candidate] >= rank[current] else current
+
+
+def _customer_profile_from_row(row: sqlite3.Row) -> CustomerProfile:
+    raw_tags = json.loads(str(row["tags_json"]))
+    tags = tuple(str(item) for item in raw_tags) if isinstance(raw_tags, list) else ()
+    return CustomerProfile(
+        customer_key=str(row["customer_key"]),
+        platform_customer_id=(
+            str(row["platform_customer_id"])
+            if row["platform_customer_id"] is not None
+            else None
+        ),
+        primary_conversation_key=str(row["primary_conversation_key"]),
+        display_name=str(row["display_name"]) if row["display_name"] is not None else None,
+        lifecycle=CustomerLifecycle(str(row["lifecycle"])),
+        intent_level=CustomerIntentLevel(str(row["intent_level"])),
+        sales_stage=(
+            SalesStage(str(row["sales_stage"]))
+            if row["sales_stage"] is not None
+            else None
+        ),
+        order_status=CustomerOrderStatus(str(row["order_status"])),
+        fulfillment_status=CustomerFulfillmentStatus(str(row["fulfillment_status"])),
+        shipped_at=_parse_optional_timestamp(row["shipped_at"]),
+        delivered_at=_parse_optional_timestamp(row["delivered_at"]),
+        automation_status=str(row["automation_status"]),
+        current_product_key=(
+            str(row["current_product_key"])
+            if row["current_product_key"] is not None
+            else None
+        ),
+        platform_product_id=(
+            str(row["platform_product_id"])
+            if row["platform_product_id"] is not None
+            else None
+        ),
+        battery_model=str(row["battery_model"]) if row["battery_model"] is not None else None,
+        required_range_km=(
+            str(row["required_range_km"])
+            if row["required_range_km"] is not None
+            else None
+        ),
+        motor_power_w=(
+            str(row["motor_power_w"]) if row["motor_power_w"] is not None else None
+        ),
+        quantity=int(row["quantity"]),
+        budget_amount=(
+            str(row["budget_amount"]) if row["budget_amount"] is not None else None
+        ),
+        last_customer_offer=(
+            str(row["last_customer_offer"])
+            if row["last_customer_offer"] is not None
+            else None
+        ),
+        accepted_price=(
+            str(row["accepted_price"]) if row["accepted_price"] is not None else None
+        ),
+        tags=tags,
+        notes=str(row["notes"]),
+        first_seen_at=_parse_optional_timestamp(row["first_seen_at"]),
+        last_seen_at=_parse_optional_timestamp(row["last_seen_at"]),
+        last_customer_message_at=_parse_optional_timestamp(row["last_customer_message_at"]),
+        last_merchant_message_at=_parse_optional_timestamp(row["last_merchant_message_at"]),
+        next_follow_up_at=_parse_optional_timestamp(row["next_follow_up_at"]),
+        conversation_count=int(row["conversation_count"]),
+        created_at=_parse_optional_timestamp(row["created_at"]),
+        updated_at=_parse_optional_timestamp(row["updated_at"]),
+    )
+
+
+def _fulfillment_state_from_row(row: sqlite3.Row) -> ConversationFulfillmentState:
+    return ConversationFulfillmentState(
+        conversation_key=str(row["conversation_key"]),
+        platform_product_id=(
+            str(row["platform_product_id"])
+            if row["platform_product_id"] is not None
+            else None
+        ),
+        status=CustomerFulfillmentStatus(str(row["status"])),
+        evidence_key=(
+            str(row["evidence_key"]) if row["evidence_key"] is not None else None
+        ),
+        evidence_text=(
+            str(row["evidence_text"]) if row["evidence_text"] is not None else None
+        ),
+        shipped_at=_parse_optional_timestamp(row["shipped_at"]),
+        delivered_at=_parse_optional_timestamp(row["delivered_at"]),
+        automation_status=str(row["automation_status"]),
+        updated_at=_parse_optional_timestamp(row["updated_at"]),
+    )

@@ -1,5 +1,5 @@
 #define AppName "闲鱼铺货助手"
-#define AppVersion "0.1.2"
+#define AppVersion "0.1.4"
 #define AppPublisher "Xianyu Assistant Team"
 #define AppExeName "XianyuAssistant.exe"
 

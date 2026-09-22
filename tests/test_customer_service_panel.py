@@ -227,6 +227,43 @@ def test_panel_lists_and_resolves_non_blocking_handoff_notification(
     assert repository.has_open_handoff("conversation-1") is False
 
 
+def test_post_delivery_handoff_stays_visible_until_explicit_restore(
+    qapp: object,
+    tmp_path: Path,
+) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    observed_at = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    repository.record_delivered_conversation(
+        conversation_key="conversation-delivered",
+        platform_product_id="item-1",
+        evidence_key="delivery-1",
+        evidence_text="订单已签收",
+        observed_at=observed_at,
+    )
+    repository.save_post_delivery_handoff(
+        conversation_key="conversation-delivered",
+        reason="平台显示订单已签收，顾客新消息已停止自动回复，请人工处理。",
+        created_at=observed_at,
+    )
+    panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig(port=9333))
+    panel.handoff_table.selectRow(0)
+
+    assert panel.resolve_handoff_button.text() == "已处理本次消息（保持人工）"
+    assert panel.restore_delivery_button.isHidden() is False
+
+    panel.resolve_selected_handoff()
+
+    assert panel.handoff_table.rowCount() == 1
+    assert panel.resolve_handoff_button.isEnabled() is False
+    assert repository.is_post_delivery_human_owned("conversation-delivered") is True
+
+    panel.restore_selected_delivery_conversation()
+
+    assert panel.handoff_table.rowCount() == 0
+    assert repository.is_post_delivery_human_owned("conversation-delivered") is False
+
+
 def test_customer_service_workspace_uses_balanced_columns_and_hides_internal_ids(
     qapp: object,
     tmp_path: Path,

@@ -9,16 +9,24 @@ from pathlib import Path
 from xianyu_assistant.customer_service.current_catalog import (
     CURRENT_PRODUCTS,
     FIRST_CONTACT_CATALOG_REPLY,
+    FIRST_CONTACT_MESSAGE_SETTING,
+    install_current_catalog,
 )
 from xianyu_assistant.customer_service.customer_service_worker import (
     CustomerServiceWorker,
+    _classify_customer_state,
     _current_operating_policy_reply,
     parse_reply_proposal,
 )
 from xianyu_assistant.customer_service.models import (
     ChatMessage,
+    ConversationFulfillmentState,
     ConversationSnapshot,
     ConversationSummary,
+    CustomerFulfillmentStatus,
+    CustomerIntentLevel,
+    CustomerLifecycle,
+    CustomerOrderStatus,
     CustomerServiceConfig,
     HistoricalExample,
     MessageDirection,
@@ -26,6 +34,8 @@ from xianyu_assistant.customer_service.models import (
     ModelResponse,
     PageHealth,
     PageHealthStatus,
+    PlatformSystemEvent,
+    PlatformSystemEventKind,
     PriceChangeDraft,
     PriceChangeReceipt,
     PriceChangeStatus,
@@ -34,6 +44,7 @@ from xianyu_assistant.customer_service.models import (
     ReceptionStatus,
     ReplyDraft,
     ReplyJobStatus,
+    ReplyProposal,
     SalesStage,
     SalesState,
     SendReceipt,
@@ -43,6 +54,8 @@ from xianyu_assistant.customer_service.protocols import (
     PriceChangeNotPerformedError,
     TextSendNotPerformedError,
 )
+from xianyu_assistant.customer_service.semantic_analysis import analyze_customer_turn
+from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 
 
 class FakeClock:
@@ -107,6 +120,26 @@ class FakeAdapter:
         return PriceChangeReceipt("5.00", approved_price)
 
 
+class FailingVoiceAdapter(FakeAdapter):
+    def request_voice_transcript(self, message_key: str) -> str | None:
+        raise RuntimeError(f"voice unavailable: {message_key}")
+
+
+class SequencedHealthAdapter(FakeAdapter):
+    def __init__(
+        self,
+        snapshots: dict[str, ConversationSnapshot],
+        health_sequence: list[PageHealth],
+    ) -> None:
+        super().__init__(snapshots)
+        self.health_sequence = health_sequence
+
+    def check_page_health(self) -> PageHealth:
+        if self.health_sequence:
+            return self.health_sequence.pop(0)
+        return PageHealth(PageHealthStatus.HEALTHY)
+
+
 class RetryableSendAdapter(FakeAdapter):
     def send_text(self, text: str) -> SendReceipt:
         del text
@@ -165,6 +198,7 @@ class FakeRepository:
         self.price_changes: list[PriceChangeDraft] = []
         self.negotiation_states: dict[str, tuple[NegotiationState, str]] = {}
         self.sales_states: dict[str, SalesState] = {}
+        self.fulfillment_states: dict[str, ConversationFulfillmentState] = {}
 
     def find_product_knowledge(self, *, platform_product_id=None, normalized_title=None):
         return self.product
@@ -299,11 +333,74 @@ class FakeRepository:
     def has_open_handoff(self, conversation_key: str) -> bool:
         return any(key == conversation_key for key, _reason in self.handoffs)
 
+    def record_delivered_conversation(
+        self,
+        *,
+        conversation_key: str,
+        platform_product_id: str | None,
+        evidence_key: str,
+        evidence_text: str,
+        observed_at: datetime,
+    ) -> ConversationFulfillmentState:
+        existing = self.fulfillment_states.get(conversation_key)
+        state = ConversationFulfillmentState(
+            conversation_key=conversation_key,
+            status=CustomerFulfillmentStatus.DELIVERED,
+            platform_product_id=platform_product_id,
+            evidence_key=evidence_key,
+            evidence_text=evidence_text,
+            delivered_at=(existing.delivered_at if existing else observed_at),
+            automation_status=(existing.automation_status if existing else "human_owned"),
+            updated_at=observed_at,
+        )
+        self.fulfillment_states[conversation_key] = state
+        return state
+
+    def record_shipped_conversation(
+        self,
+        *,
+        conversation_key: str,
+        platform_product_id: str | None,
+        evidence_key: str,
+        evidence_text: str,
+        observed_at: datetime,
+    ) -> ConversationFulfillmentState:
+        existing = self.fulfillment_states.get(conversation_key)
+        state = ConversationFulfillmentState(
+            conversation_key=conversation_key,
+            status=CustomerFulfillmentStatus.SHIPPED,
+            platform_product_id=platform_product_id,
+            evidence_key=evidence_key,
+            evidence_text=evidence_text,
+            shipped_at=(existing.shipped_at if existing else observed_at),
+            automation_status=(existing.automation_status if existing else "human_owned"),
+            updated_at=observed_at,
+        )
+        self.fulfillment_states[conversation_key] = state
+        return state
+
+    def is_post_delivery_human_owned(self, conversation_key: str) -> bool:
+        state = self.fulfillment_states.get(conversation_key)
+        return state is not None and state.automation_status == "human_owned"
+
+    def save_post_delivery_handoff(
+        self, *, conversation_key: str, reason: str, created_at: datetime
+    ) -> None:
+        self.save_handoff_event(
+            conversation_key=conversation_key,
+            reason=reason,
+            created_at=created_at,
+        )
+
 
 class FirstContactRepository(FakeRepository):
     def __init__(self) -> None:
         super().__init__()
         self.first_contact: dict[str, tuple[str, str]] = {}
+        self.settings: dict[str, str] = {}
+
+    def get_setting(self, name: str, default: str | None = None) -> str | None:
+        return self.settings.get(name, default)
 
     def should_send_first_contact_catalog(
         self, conversation_key: str, *, snapshot_has_outgoing: bool
@@ -432,6 +529,40 @@ def _snapshot(key: str, *texts: str) -> ConversationSnapshot:
     return ConversationSnapshot(key, messages, platform_product_id="p1", product_title="测试商品")
 
 
+def _delivered_snapshot(key: str, *texts: str) -> ConversationSnapshot:
+    snapshot = _snapshot(key, *texts)
+    return ConversationSnapshot(
+        snapshot.conversation_key,
+        snapshot.messages,
+        platform_product_id=snapshot.platform_product_id,
+        product_title=snapshot.product_title,
+        system_events=(
+            PlatformSystemEvent(
+                f"delivery-{key}",
+                PlatformSystemEventKind.ORDER_DELIVERED,
+                "订单已签收",
+            ),
+        ),
+    )
+
+
+def _shipped_snapshot(key: str, *texts: str) -> ConversationSnapshot:
+    snapshot = _snapshot(key, *texts)
+    return ConversationSnapshot(
+        snapshot.conversation_key,
+        snapshot.messages,
+        platform_product_id=snapshot.platform_product_id,
+        product_title=snapshot.product_title,
+        system_events=(
+            PlatformSystemEvent(
+                f"shipment-{key}",
+                PlatformSystemEventKind.ORDER_SHIPPED,
+                "你已发货",
+            ),
+        ),
+    )
+
+
 def _dialog_snapshot(
     key: str,
     *turns: tuple[MessageDirection, str],
@@ -472,10 +603,153 @@ def test_current_sales_business_rules_are_deterministic() -> None:
     assert "容量测试视频" in (video.handoff_reason or "")
 
 
+def test_worker_persists_durable_customer_state_with_real_repository(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _snapshot("c1", "6030 650可以吗")})
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    install_current_catalog(repository)
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel(),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(6)
+    worker.run_once()
+
+    profile = repository.find_customer_profile_by_conversation("c1")
+    assert profile is not None
+    assert profile.lifecycle is CustomerLifecycle.NEGOTIATING
+    assert profile.intent_level is CustomerIntentLevel.HIGH
+    assert profile.battery_model == "60V30Ah"
+    assert profile.last_customer_offer == "650"
+    assert profile.accepted_price == "650"
+    assert profile.last_customer_message_at == clock.now()
+    assert profile.last_merchant_message_at == clock.now()
+    assert [
+        event.event_type
+        for event in reversed(repository.list_customer_state_events(profile.customer_key))
+    ] == ["customer_turn_classified", "merchant_reply_sent"]
+
+
+def test_paid_customer_is_classified_as_ordered() -> None:
+    lifecycle, intent, order_status = _classify_customer_state(
+        "我已经付款了",
+        analyze_customer_turn("我已经付款了"),
+        ReplyProposal(reply_text="好的", intent="order_status"),
+        None,
+    )
+
+    assert lifecycle is CustomerLifecycle.ORDERED
+    assert intent is CustomerIntentLevel.HIGH
+    assert order_status is CustomerOrderStatus.ORDERED
+
+
+def test_paid_customer_is_not_intercepted_without_platform_delivery_event() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _snapshot("c1", "我已经付款了")})
+    repository = FakeRepository()
+    model = FakeModel()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        model,
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent
+    assert repository.handoffs == []
+    assert repository.fulfillment_states == {}
+
+
+def test_platform_shipped_customer_is_handed_off_before_model_or_send() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _shipped_snapshot("c1", "收到后怎么安装")})
+    repository = FakeRepository()
+    model = FakeModel()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        model,
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert model.calls == 0
+    assert adapter.sent == []
+    assert repository.handoffs == [
+        ("c1", "平台显示你已发货，顾客新消息已停止自动回复，请人工处理。")
+    ]
+    assert repository.fulfillment_states["c1"].status is CustomerFulfillmentStatus.SHIPPED
+    assert repository.fulfillment_states["c1"].automation_status == "human_owned"
+
+
+def test_delivered_event_alone_does_not_create_a_new_human_lock() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _delivered_snapshot("c1", "谢谢")})
+    repository = FakeRepository()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel(),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent
+    assert repository.handoffs == []
+    assert repository.fulfillment_states == {}
+
+
+def test_shipment_appearing_during_review_discards_draft_and_hands_off() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _snapshot("c1", "6030尺寸多大")})
+    repository = FakeRepository()
+    model = FakeModel()
+    worker = _worker(adapter, clock, repository, model)
+    worker.start()
+    worker.run_once()
+    clock.advance(6)
+    worker.run_once()
+    draft = worker.drafts.list()[-1]
+    assert draft.status is ReplyJobStatus.AWAITING_REVIEW
+
+    adapter.snapshots["c1"] = _shipped_snapshot("c1", "6030尺寸多大")
+    result = worker.approve_draft(draft.job_id)
+
+    assert result.status is ReplyJobStatus.HANDOFF
+    assert result.sent is False
+    assert adapter.sent == []
+    assert repository.handoffs
+
+
 def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> None:
     clock = FakeClock()
     clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
-    adapter = FakeAdapter({"c1": _snapshot("c1", "这个电池质量怎么样")})
+    adapter = FakeAdapter({"c1": _snapshot("c1", "这个电池多少钱")})
     repository = FakeRepository()
     worker = CustomerServiceWorker(
         adapter,
@@ -497,7 +771,7 @@ def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> N
 
     adapter.snapshots["c1"] = _dialog_snapshot(
         "c1",
-        (MessageDirection.INCOMING, "这个电池质量怎么样"),
+        (MessageDirection.INCOMING, "这个电池多少钱"),
         (MessageDirection.OUTGOING, first_sent),
     )
     last = adapter.snapshots["c1"].messages[-1]
@@ -533,7 +807,7 @@ def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> N
 def test_due_sales_follow_up_is_cancelled_if_customer_has_replied() -> None:
     clock = FakeClock()
     clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
-    adapter = FakeAdapter({"c1": _snapshot("c1", "这个电池质量怎么样")})
+    adapter = FakeAdapter({"c1": _snapshot("c1", "这个电池多少钱")})
     repository = FakeRepository()
     worker = CustomerServiceWorker(
         adapter,
@@ -550,7 +824,7 @@ def test_due_sales_follow_up_is_cancelled_if_customer_has_replied() -> None:
 
     adapter.snapshots["c1"] = _dialog_snapshot(
         "c1",
-        (MessageDirection.INCOMING, "这个电池质量怎么样"),
+        (MessageDirection.INCOMING, "这个电池多少钱"),
         (MessageDirection.OUTGOING, first_sent),
         (MessageDirection.INCOMING, "我是二轮车"),
     )
@@ -666,6 +940,31 @@ def test_existing_merchant_message_disables_first_contact_catalog() -> None:
     assert len(adapter.sent) == 1
     assert adapter.sent[0].startswith("要看尺寸能不能放下")
     assert not adapter.sent[0].startswith(FIRST_CONTACT_CATALOG_REPLY)
+
+
+def test_first_customer_conversation_uses_editable_saved_message() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    custom_message = "欢迎咨询铁塔电池\n当前活动请以这里为准"
+    repository.settings[FIRST_CONTACT_MESSAGE_SETTING] = custom_message
+    adapter = FakeAdapter({"c1": _snapshot("c1", "6030能跑多远")})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("这个要结合车型确认"),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0].startswith(custom_message)
+    assert not adapter.sent[0].startswith(FIRST_CONTACT_CATALOG_REPLY)
+    assert repository.first_contact["c1"][1] == "sent"
 
 
 def test_first_observation_keeps_the_complete_customer_turn() -> None:
@@ -1621,7 +1920,7 @@ def test_handoff_isolates_only_that_conversation_and_other_customers_continue() 
     assert repository.handoffs == [
         ("needs-human", "未匹配商品的会话涉及安全、售后或争议问题。")
     ]
-    assert adapter.sent == ["6030尺寸17-18-32\n你是二轮还是三轮？我再帮你核下适配和续航"]
+    assert adapter.sent == ["6030尺寸17-18-32"]
     assert worker.status is ReceptionStatus.RUNNING
 
     handoff_open_count = adapter.opened.count("needs-human")
@@ -1815,9 +2114,7 @@ def test_auto_mode_sends_verified_text_but_does_not_create_human_style_example()
     clock.advance(10)
     worker.run_once()
 
-    assert adapter.sent == [
-        "您好，测试商品目前按页面价格出售。\n你是二轮还是三轮？我再帮你核下适配和续航"
-    ]
+    assert adapter.sent == ["您好，测试商品目前按页面价格出售。"]
     assert worker.drafts.list()[-1].status is ReplyJobStatus.SENT
     assert not any(getattr(item, "trust_level", None) == "human_confirmed" for item in repository.saved)
 
@@ -1848,6 +2145,93 @@ def test_repeated_model_failures_halt_auto_reception() -> None:
 
     assert worker.status.value == "halted"
     assert adapter.sent == []
+
+
+def test_voice_failure_hands_off_only_that_conversation_and_keeps_running() -> None:
+    clock = FakeClock()
+    voice = ConversationSnapshot(
+        "c1",
+        (
+            ChatMessage(
+                "c1-m1",
+                MessageDirection.INCOMING,
+                MessageKind.VOICE,
+                None,
+            ),
+        ),
+        platform_product_id="p1",
+        product_title="测试商品",
+    )
+    adapter = FailingVoiceAdapter({"c1": voice, "c2": _snapshot("c2", "6030多少钱")})
+    repository = FakeRepository()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel(),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert worker.status is ReceptionStatus.RUNNING
+    assert any(key == "c1" and "读取上下文" in reason for key, reason in repository.handoffs)
+    assert adapter.sent
+    drafts = worker.drafts.list()
+    assert any(
+        draft.conversation_key == "c1" and draft.status is ReplyJobStatus.FAILED
+        for draft in drafts
+    )
+    assert drafts[-1].conversation_key == "c2"
+
+
+def test_transient_page_structure_failure_recovers_without_global_halt() -> None:
+    adapter = SequencedHealthAdapter(
+        {},
+        [
+            PageHealth(PageHealthStatus.HEALTHY),
+            PageHealth(PageHealthStatus.STRUCTURE_CHANGED, "页面重绘"),
+            PageHealth(PageHealthStatus.HEALTHY),
+        ],
+    )
+    worker = CustomerServiceWorker(
+        adapter,
+        FakeRepository(),
+        FakeModel(),
+        config=CustomerServiceConfig(max_page_health_failures=3),
+    )
+
+    worker.start()
+    worker.run_once()
+    worker.run_once()
+
+    assert worker.status is ReceptionStatus.RUNNING
+
+
+def test_repeated_page_structure_failure_halts_at_configured_threshold() -> None:
+    unhealthy = PageHealth(PageHealthStatus.STRUCTURE_CHANGED, "会话列表结构异常")
+    adapter = SequencedHealthAdapter(
+        {},
+        [PageHealth(PageHealthStatus.HEALTHY), unhealthy, unhealthy, unhealthy],
+    )
+    worker = CustomerServiceWorker(
+        adapter,
+        FakeRepository(),
+        FakeModel(),
+        config=CustomerServiceConfig(max_page_health_failures=3),
+    )
+
+    worker.start()
+    worker.run_once()
+    worker.run_once()
+    worker.run_once()
+
+    assert worker.status is ReceptionStatus.HALTED
+    assert worker.stop_reason is not None
+    assert "连续3次" in worker.stop_reason
 
 
 def test_repeated_send_failures_halt_auto_reception() -> None:

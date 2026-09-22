@@ -28,6 +28,8 @@ from xianyu_assistant.customer_service.models import (
     MessageKind,
     PageHealth,
     PageHealthStatus,
+    PlatformSystemEvent,
+    PlatformSystemEventKind,
     PriceChangeReceipt,
     SendReceipt,
 )
@@ -116,6 +118,7 @@ class ChatPageSelectors:
 
     conversation_items: str
     message_items: str
+    system_message_items: str | None = None
     conversation_key_attribute: str = "data-conversation-key"
     message_key_attribute: str = "data-message-key"
     direction_attribute: str = "data-direction"
@@ -182,6 +185,9 @@ REAL_XIANYU_CHAT_CONTRACT = ChatPageContract(
     selectors=ChatPageSelectors(
         conversation_items=".conversation-item--JReyg97P",
         message_items=".message-row--pIWaXNhZ",
+        # Platform timeline tips are separate from customer/merchant message
+        # rows.  Match the stable class prefix and verify exact text locally.
+        system_message_items='[class^="msg-tips--"]',
         incoming_direction_selector=":scope > div > img.avatar--e05bt3Ju",
         outgoing_direction_selector=":scope > div > div > img.avatar--e05bt3Ju",
         text_selector=".message-text--zV88pB7N",
@@ -621,11 +627,30 @@ class PlaywrightXianyuChatAdapter:
                     product_id = product_id or _string(item_info.get("item_id"))
                     product_title = product_title or _string(item_info.get("title"))
         conversation_key = self._current_conversation_key(page)
+        system_events: list[PlatformSystemEvent] = []
+        if selectors.system_message_items:
+            for item in page.locator(selectors.system_message_items).all():
+                text = " ".join(item.inner_text().split())
+                event_kind = {
+                    "你已发货": PlatformSystemEventKind.ORDER_SHIPPED,
+                    "订单已签收": PlatformSystemEventKind.ORDER_DELIVERED,
+                }.get(text)
+                if event_kind is None:
+                    continue
+                evidence = f"{conversation_key}:{product_id or ''}:{text}"
+                system_events.append(
+                    PlatformSystemEvent(
+                        event_key=f"platform-{hashlib.sha256(evidence.encode()).hexdigest()}",
+                        kind=event_kind,
+                        text=text,
+                    )
+                )
         return ConversationSnapshot(
             conversation_key=conversation_key,
             messages=tuple(messages),
             platform_product_id=product_id,
             product_title=product_title,
+            system_events=tuple(system_events),
         )
 
     def request_voice_transcript(self, message_key: str) -> str | None:

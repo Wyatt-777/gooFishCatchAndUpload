@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "xianyu-assistant"
-version = "0.1.2"
+version = "0.1.4"
 description = "Windows desktop assistant for Xianyu product collection and publishing assistance."
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
@@ -23,7 +23,7 @@ dev = [
     "ruff>=0.6,<1.0",
 ]
 
-[project.scripts]
+[project.gui-scripts]
 xianyu-assistant = "xianyu_assistant.main:main"
 
 [tool.hatch.build.targets.wheel]

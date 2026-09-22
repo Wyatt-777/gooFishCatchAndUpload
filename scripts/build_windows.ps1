@@ -52,6 +52,41 @@ finally {
 $releaseDirectory = Join-Path $projectRoot "dist\XianyuAssistant"
 $releaseArchive = Join-Path $projectRoot "dist\XianyuAssistant-win64.zip"
 
+function Get-WindowsPESubsystem {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [System.IO.File]::OpenRead($Path)
+    $reader = [System.IO.BinaryReader]::new($stream)
+    try {
+        if ($reader.ReadUInt16() -ne 0x5a4d) {
+            throw "不是有效的 Windows PE 文件：$Path"
+        }
+        $stream.Position = 0x3c
+        $peOffset = $reader.ReadUInt32()
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            throw "PE 文件头无效：$Path"
+        }
+        $optionalHeaderOffset = $peOffset + 24
+        $stream.Position = $optionalHeaderOffset
+        $optionalHeaderMagic = $reader.ReadUInt16()
+        if ($optionalHeaderMagic -notin @(0x010b, 0x020b)) {
+            throw "PE 可选头格式不受支持：$Path"
+        }
+        $stream.Position = $optionalHeaderOffset + 68
+        return $reader.ReadUInt16()
+    }
+    finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
+$mainExecutable = Join-Path $releaseDirectory "XianyuAssistant.exe"
+if ((Get-WindowsPESubsystem -Path $mainExecutable) -ne 2) {
+    throw "主程序不是 Windows GUI 子系统，启动时会出现命令行窗口：$mainExecutable"
+}
+
 # Playwright bundles a console-subsystem node.exe. Even when the parent asks
 # Windows to hide it, conhost can briefly flash before the Qt window is painted.
 # Change only the bundled release copy to the GUI subsystem; its redirected

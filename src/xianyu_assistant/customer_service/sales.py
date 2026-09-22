@@ -52,6 +52,61 @@ _TRANSACTION_MARKERS = (
     "发货",
     "单号",
 )
+_TRANSACTION_REPLY_MARKERS = (
+    "准备给你发货",
+    "准备发货",
+    "给你发货",
+    "已经发货",
+    "已发货",
+    "订单已",
+    "物流单号",
+)
+_ROUTINE_SERVICE_MARKERS = (
+    "充电器",
+    "匹配",
+    "接口",
+    "插头",
+    "怎么装",
+    "安装",
+    "怎么用",
+    "充电",
+    "快递",
+    "物流",
+    "包邮",
+    "运费",
+    "哪里发",
+    "发哪里",
+)
+_SALES_QUESTION_MARKERS = (
+    "多少钱",
+    "多钱",
+    "什么价",
+    "价格",
+    "怎么卖",
+    "推荐",
+    "怎么选",
+    "选哪个",
+    "选哪款",
+    "哪款合适",
+    "买哪个",
+    "买哪款",
+    "配哪个",
+    "配哪款",
+    "要多大",
+    "多大容量",
+)
+_ROUTINE_INTENTS = frozenset(
+    {
+        "charger",
+        "charging_duration",
+        "default_carriers",
+        "first_use",
+        "order_status",
+        "shipping",
+        "shipping_origin",
+        "shipping_restricted",
+    }
+)
 _VEHICLE_MARKERS = ("二轮", "三轮", "车型", "电动车", "电机")
 _RANGE_MARKERS = ("续航", "跑多远", "公里", "通勤", "长途")
 _QUESTION_RE = re.compile(r"[?？]")
@@ -78,13 +133,17 @@ def build_sales_plan(
     """Add at most one relevant sales move without changing factual decisions."""
 
     folded = normalize_for_matching(query)
+    reply_folded = normalize_for_matching(proposal.reply_text)
     if (
         proposal.requires_handoff
         or proposal.intent == "handoff"
         or proposal.intent == "warranty"
+        or proposal.intent in _ROUTINE_INTENTS
         or negotiation_active
         or any(marker in folded for marker in _NO_SALES_MARKERS)
         or any(marker in folded for marker in _TRANSACTION_MARKERS)
+        or any(marker in reply_folded for marker in _TRANSACTION_REPLY_MARKERS)
+        or any(marker in folded for marker in _ROUTINE_SERVICE_MARKERS)
     ):
         return SalesPlan(proposal, SalesStage.PAUSED)
 
@@ -94,6 +153,15 @@ def build_sales_plan(
         if message.direction is MessageDirection.INCOMING
     )
     customer_folded = normalize_for_matching(customer_text)
+    merchant_folded = normalize_for_matching(" ".join(recent_merchant_replies))
+    has_vehicle = any(marker in customer_folded for marker in _VEHICLE_MARKERS)
+    has_range = any(marker in customer_folded for marker in _RANGE_MARKERS)
+    asked_vehicle = "二轮还是三轮" in merchant_folded
+    asked_range = any(
+        marker in merchant_folded
+        for marker in ("想跑多少公里", "跑多少公里", "通勤还是跑长途")
+    )
+    qualification_already_asked = asked_vehicle or asked_range
 
     if proposal.intent == "battery_catalog":
         return SalesPlan(
@@ -102,18 +170,36 @@ def build_sales_plan(
             "你是二轮还是三轮，平时想跑多少公里？我按用途给你配",
         )
 
+    sales_question = proposal.intent in {
+        "price",
+        "price_inquiry",
+        "recommendation",
+        "battery_recommendation",
+    } or any(marker in folded for marker in _SALES_QUESTION_MARKERS)
+    if not sales_question or qualification_already_asked:
+        return SalesPlan(proposal, SalesStage.PAUSED)
+
     if knowledge is None:
-        nudge = "你是二轮还是三轮？平时想跑多少公里"
+        if not has_vehicle and not asked_vehicle:
+            nudge = "你是二轮还是三轮？平时想跑多少公里"
+            follow_up = "方便说下车型和想跑的公里数，我给你配合适的"
+        elif not has_range and not asked_range:
+            nudge = "平时想跑多少公里？我按用途帮你看"
+            follow_up = "你平时主要通勤还是跑长途？我按续航帮你看"
+        else:
+            return SalesPlan(proposal, SalesStage.PAUSED)
         enhanced = _append_once(proposal, nudge, recent_merchant_replies)
         return SalesPlan(
             enhanced,
             SalesStage.QUALIFY,
-            "方便说下车型和想跑的公里数，我给你配合适的",
+            follow_up,
         )
 
-    has_vehicle = any(marker in customer_folded for marker in _VEHICLE_MARKERS)
-    has_range = any(marker in customer_folded for marker in _RANGE_MARKERS)
-    if not has_vehicle and not _QUESTION_RE.search(proposal.reply_text):
+    if (
+        not has_vehicle
+        and not asked_vehicle
+        and not _QUESTION_RE.search(proposal.reply_text)
+    ):
         nudge = "你是二轮还是三轮？我再帮你核下适配和续航"
         enhanced = _append_once(proposal, nudge, recent_merchant_replies)
         return SalesPlan(
@@ -121,7 +207,7 @@ def build_sales_plan(
             SalesStage.QUALIFY,
             "方便说下车型和想跑的公里数，我再帮你核下适配",
         )
-    if not has_range and not _QUESTION_RE.search(proposal.reply_text):
+    if not has_range and not asked_range and not _QUESTION_RE.search(proposal.reply_text):
         nudge = "平时想跑多少公里？我按用途帮你看"
         enhanced = _append_once(proposal, nudge, recent_merchant_replies)
         return SalesPlan(

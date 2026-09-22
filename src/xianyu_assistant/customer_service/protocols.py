@@ -15,8 +15,14 @@ from typing import Protocol
 from xianyu_assistant.customer_service.importer import ImportBundle
 from xianyu_assistant.customer_service.knowledge_importer import CleanedKnowledgeBundle
 from xianyu_assistant.customer_service.models import (
+    ConversationFulfillmentState,
     ConversationSnapshot,
     ConversationSummary,
+    CustomerIntentLevel,
+    CustomerLifecycle,
+    CustomerOrderStatus,
+    CustomerProfile,
+    CustomerStateEvent,
     HandoffEvent,
     HistoricalExample,
     ImagePayload,
@@ -27,6 +33,7 @@ from xianyu_assistant.customer_service.models import (
     PriceChangeReceipt,
     ProductKnowledge,
     ReplyDraft,
+    SalesStage,
     SalesState,
     SendReceipt,
 )
@@ -116,6 +123,9 @@ class DeepSeekClient(Protocol):
 class CustomerServiceRepository(Protocol):
     """Persistence boundary for knowledge, drafts, audit, and deduplication."""
 
+    def get_setting(self, name: str, default: str | None = None) -> str | None:
+        """Read one non-secret runtime setting."""
+
     def find_product_knowledge(
         self,
         *,
@@ -185,10 +195,48 @@ class CustomerServiceRepository(Protocol):
     ) -> ReplyDraft | None:
         """Load an existing job for one conversation batch to avoid restart duplicates."""
 
+    def recover_interrupted_reply_jobs(self, *, recovered_at: datetime) -> int:
+        """Safely close incomplete jobs left by a crash or forced stop."""
+
     def save_handoff_event(
         self, *, conversation_key: str, reason: str, created_at: datetime
     ) -> None:
         """Record a short-lived local handoff reason without sending anything."""
+
+    def record_delivered_conversation(
+        self,
+        *,
+        conversation_key: str,
+        platform_product_id: str | None,
+        evidence_key: str,
+        evidence_text: str,
+        observed_at: datetime,
+    ) -> ConversationFulfillmentState:
+        """Persist platform-confirmed delivery and its conversation automation lock."""
+
+    def record_shipped_conversation(
+        self,
+        *,
+        conversation_key: str,
+        platform_product_id: str | None,
+        evidence_key: str,
+        evidence_text: str,
+        observed_at: datetime,
+    ) -> ConversationFulfillmentState:
+        """Persist platform-confirmed shipment and its conversation automation lock."""
+
+    def get_conversation_fulfillment(
+        self, conversation_key: str
+    ) -> ConversationFulfillmentState | None:
+        """Read fulfillment state for one order conversation."""
+
+    def is_post_delivery_human_owned(self, conversation_key: str) -> bool:
+        """Return whether shipped/delivered messages require a human."""
+
+    def save_post_delivery_handoff(
+        self, *, conversation_key: str, reason: str, created_at: datetime
+    ) -> None:
+        """Create a post-delivery notification without releasing its durable lock."""
 
     def has_open_handoff(self, conversation_key: str) -> bool:
         """Return whether automatic handling is suspended for this conversation."""
@@ -197,7 +245,12 @@ class CustomerServiceRepository(Protocol):
         """List persisted in-app notifications awaiting human handling."""
 
     def resolve_handoff_event(self, event_id: int) -> bool:
-        """Mark a notification handled so future customer messages may resume."""
+        """Close a notification; sticky post-delivery locks remain in force."""
+
+    def restore_conversation_automation(
+        self, conversation_key: str, *, restored_at: datetime
+    ) -> bool:
+        """Explicitly restore automation for one delivered-order conversation."""
 
     def has_processed_fingerprint(self, batch_fingerprint: str) -> bool:
         """Check the permanent duplicate-send guard."""
@@ -216,6 +269,69 @@ class CustomerServiceRepository(Protocol):
         observed_at: datetime,
     ) -> int:
         """Persist a complete customer turn and return its conversation version."""
+
+    def observe_customer_summary(
+        self,
+        summary: ConversationSummary,
+        *,
+        observed_at: datetime,
+        platform_customer_id: str | None = None,
+    ) -> CustomerProfile:
+        """Create or refresh a durable profile without merging on display name."""
+
+    def record_customer_state(
+        self,
+        *,
+        event_key: str,
+        conversation_key: str,
+        event_type: str,
+        lifecycle: CustomerLifecycle,
+        intent_level: CustomerIntentLevel,
+        observed_at: datetime,
+        product_key: str | None = None,
+        platform_product_id: str | None = None,
+        sales_stage: SalesStage | None = None,
+        order_status: CustomerOrderStatus | None = None,
+        automation_status: str | None = None,
+        battery_model: str | None = None,
+        required_range_km: str | None = None,
+        motor_power_w: str | None = None,
+        quantity: int | None = None,
+        budget_amount: str | None = None,
+        last_customer_offer: str | None = None,
+        accepted_price: str | None = None,
+        next_follow_up_at: datetime | None = None,
+        clear_next_follow_up: bool = False,
+        payload: dict[str, object] | None = None,
+    ) -> CustomerProfile:
+        """Apply one idempotent deterministic profile transition."""
+
+    def mark_customer_reply_sent(
+        self,
+        conversation_key: str,
+        *,
+        event_key: str,
+        sales_stage: SalesStage | None,
+        next_follow_up_at: datetime | None,
+        sent_at: datetime,
+    ) -> None:
+        """Record a verified merchant reply and its next-follow-up time."""
+
+    def get_customer_profile(self, customer_key: str) -> CustomerProfile | None:
+        """Read one durable customer profile."""
+
+    def find_customer_profile_by_conversation(
+        self, conversation_key: str
+    ) -> CustomerProfile | None:
+        """Resolve one conversation to its durable customer profile."""
+
+    def list_customer_profiles(self, limit: int = 100) -> Sequence[CustomerProfile]:
+        """List durable profiles by recent activity."""
+
+    def list_customer_state_events(
+        self, customer_key: str, *, limit: int = 100
+    ) -> Sequence[CustomerStateEvent]:
+        """List audited state transitions for one customer."""
 
     def update_customer_turn(
         self,

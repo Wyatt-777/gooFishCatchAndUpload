@@ -33,7 +33,12 @@ from xianyu_assistant.customer_service.browser_adapter import (
     REAL_XIANYU_CHAT_CONTRACT,
     PlaywrightXianyuChatAdapter,
 )
-from xianyu_assistant.customer_service.current_catalog import install_current_catalog
+from xianyu_assistant.customer_service.current_catalog import (
+    FIRST_CONTACT_CATALOG_REPLY,
+    FIRST_CONTACT_MESSAGE_SETTING,
+    MAX_FIRST_CONTACT_MESSAGE_LENGTH,
+    install_current_catalog,
+)
 from xianyu_assistant.customer_service.deepseek_client import (
     DeepSeekClient,
     DeepSeekClientError,
@@ -146,6 +151,35 @@ class CustomerServiceSettingsPanel(QWidget):
         api_form.addRow(api_buttons)
         api_form.addRow(self.config_status_label)
 
+        self.first_contact_message_input = QPlainTextEdit()
+        self.first_contact_message_input.setPlainText(
+            repository.get_setting(
+                FIRST_CONTACT_MESSAGE_SETTING,
+                FIRST_CONTACT_CATALOG_REPLY,
+            )
+            or FIRST_CONTACT_CATALOG_REPLY
+        )
+        self.first_contact_message_input.setPlaceholderText("请输入首次对话时发送的话术")
+        self.first_contact_message_input.setMinimumHeight(210)
+        self.save_first_contact_message_button = QPushButton("保存首轮话术")
+        self.save_first_contact_message_button.setObjectName("primaryAction")
+        self.reset_first_contact_message_button = QPushButton("恢复默认话术")
+        first_contact_buttons = QHBoxLayout()
+        first_contact_buttons.addWidget(self.save_first_contact_message_button)
+        first_contact_buttons.addWidget(self.reset_first_contact_message_button)
+        first_contact_buttons.addStretch()
+        first_contact_group = QGroupBox("首次对话固定话术")
+        first_contact_layout = QVBoxLayout(first_contact_group)
+        first_contact_hint = QLabel(
+            "仅在与顾客真正首次对话时发送一次；保存后立即对新的首次会话生效，"
+            "不会重新发送给已经接待过的顾客。"
+        )
+        first_contact_hint.setWordWrap(True)
+        first_contact_hint.setObjectName("mutedText")
+        first_contact_layout.addWidget(first_contact_hint)
+        first_contact_layout.addWidget(self.first_contact_message_input)
+        first_contact_layout.addLayout(first_contact_buttons)
+
         self.product_table = QTableWidget(0, 6)
         self.product_table.setHorizontalHeaderLabels(("商品 Key", "名称", "平台 ID", "标价", "最低价", "状态"))
         self._configure_table(self.product_table)
@@ -245,6 +279,7 @@ class CustomerServiceSettingsPanel(QWidget):
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addWidget(api_group)
+        layout.addWidget(first_contact_group)
         layout.addWidget(product_group)
         layout.addWidget(media_group)
         layout.addWidget(import_group)
@@ -254,6 +289,12 @@ class CustomerServiceSettingsPanel(QWidget):
         self.save_config_button.clicked.connect(self.save_configuration)
         self.test_connection_button.clicked.connect(self.test_connection)
         self.clear_key_button.clicked.connect(self.clear_api_key)
+        self.save_first_contact_message_button.clicked.connect(
+            self.save_first_contact_message
+        )
+        self.reset_first_contact_message_button.clicked.connect(
+            self.reset_first_contact_message
+        )
         self.add_product_button.clicked.connect(self.add_product)
         self.sync_chat_button.clicked.connect(self.sync_live_chats)
         self.edit_product_button.clicked.connect(self.edit_product)
@@ -305,6 +346,28 @@ class CustomerServiceSettingsPanel(QWidget):
         self.api_key_input.clear()
         self.credential_status_label.setText(self._credential_status())
         self._set_status("DeepSeek API Key 已从安全凭据存储清除。")
+
+    def save_first_contact_message(self) -> None:
+        """Persist the operator-edited one-time welcome text."""
+        message = self.first_contact_message_input.toPlainText().strip()
+        if not message:
+            self._set_status("首轮话术不能为空。", error=True)
+            return
+        if len(message) > MAX_FIRST_CONTACT_MESSAGE_LENGTH:
+            self._set_status(
+                f"首轮话术不能超过 {MAX_FIRST_CONTACT_MESSAGE_LENGTH} 个字符。",
+                error=True,
+            )
+            return
+        self.repository.set_setting(FIRST_CONTACT_MESSAGE_SETTING, message)
+        self.first_contact_message_input.setPlainText(message)
+        self._set_status("首轮话术已保存，将对新的首次会话生效。")
+
+    def reset_first_contact_message(self) -> None:
+        """Remove the override and restore the built-in reviewed catalog."""
+        self.repository.delete_setting(FIRST_CONTACT_MESSAGE_SETTING)
+        self.first_contact_message_input.setPlainText(FIRST_CONTACT_CATALOG_REPLY)
+        self._set_status("首轮话术已恢复为默认内容。")
 
     def add_product(self) -> None:
         dialog = ProductKnowledgeDialog(parent=self)

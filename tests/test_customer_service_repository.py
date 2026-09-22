@@ -7,6 +7,11 @@ from pathlib import Path
 
 from xianyu_assistant.customer_service.importer import ChatHistoryImporter
 from xianyu_assistant.customer_service.models import (
+    ConversationSummary,
+    CustomerFulfillmentStatus,
+    CustomerIntentLevel,
+    CustomerLifecycle,
+    CustomerOrderStatus,
     PriceChangeDraft,
     PriceChangeStatus,
     ReplyDraft,
@@ -16,6 +21,259 @@ from xianyu_assistant.customer_service.models import (
 )
 from xianyu_assistant.customer_service.negotiation import NegotiationState
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
+
+
+def test_customer_profiles_link_only_by_stable_platform_identity(tmp_path: Path) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 21, 10, 0, tzinfo=UTC)
+
+    first = repository.observe_customer_summary(
+        ConversationSummary("conversation-1", display_name="同名顾客"),
+        observed_at=observed_at,
+        platform_customer_id="buyer-1",
+    )
+    second = repository.observe_customer_summary(
+        ConversationSummary("conversation-2", display_name="买家新昵称"),
+        observed_at=observed_at + timedelta(minutes=1),
+        platform_customer_id="buyer-1",
+    )
+    same_name_without_id = repository.observe_customer_summary(
+        ConversationSummary("conversation-3", display_name="同名顾客"),
+        observed_at=observed_at + timedelta(minutes=2),
+    )
+
+    assert first.customer_key == second.customer_key == "customer-buyer-1"
+    assert second.conversation_count == 2
+    assert second.display_name == "买家新昵称"
+    assert same_name_without_id.customer_key == "conversation-3"
+    assert len(repository.list_customer_profiles()) == 2
+
+
+def test_delivered_order_lock_is_conversation_scoped_sticky_and_explicitly_restorable(
+    tmp_path: Path,
+) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 21, 10, 0, tzinfo=UTC)
+    repository.observe_customer_summary(
+        ConversationSummary(
+            "conversation-1",
+            display_name="顾客甲",
+            platform_product_id="item-1",
+        ),
+        observed_at=observed_at,
+    )
+
+    state = repository.record_delivered_conversation(
+        conversation_key="conversation-1",
+        platform_product_id="item-1",
+        evidence_key="platform-delivery-1",
+        evidence_text="订单已签收",
+        observed_at=observed_at,
+    )
+    repository.save_post_delivery_handoff(
+        conversation_key="conversation-1",
+        reason="平台显示订单已签收，顾客新消息已停止自动回复，请人工处理。",
+        created_at=observed_at,
+    )
+    event = repository.list_open_handoff_events()[0]
+
+    assert state.status is CustomerFulfillmentStatus.DELIVERED
+    assert state.automation_status == "human_owned"
+    assert event.handoff_type == "post_delivery"
+    assert event.release_on_resolve is False
+    assert repository.resolve_handoff_event(event.event_id) is True
+    assert repository.is_post_delivery_human_owned("conversation-1") is True
+
+    assert repository.restore_conversation_automation(
+        "conversation-1",
+        restored_at=observed_at + timedelta(minutes=1),
+    )
+    assert repository.is_post_delivery_human_owned("conversation-1") is False
+
+    repeated = repository.record_delivered_conversation(
+        conversation_key="conversation-1",
+        platform_product_id="item-1",
+        evidence_key="platform-delivery-1",
+        evidence_text="订单已签收",
+        observed_at=observed_at + timedelta(minutes=2),
+    )
+    assert repeated.automation_status == "active"
+    profile = repository.find_customer_profile_by_conversation("conversation-1")
+    assert profile is not None
+    assert profile.fulfillment_status is CustomerFulfillmentStatus.DELIVERED
+    assert profile.delivered_at == observed_at
+
+
+def test_shipped_order_lock_is_durable_and_restorable(tmp_path: Path) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 22, 10, 0, tzinfo=UTC)
+    repository.observe_customer_summary(
+        ConversationSummary(
+            "conversation-shipped",
+            display_name="顾客乙",
+            platform_product_id="item-2",
+        ),
+        observed_at=observed_at,
+    )
+
+    state = repository.record_shipped_conversation(
+        conversation_key="conversation-shipped",
+        platform_product_id="item-2",
+        evidence_key="platform-shipment-1",
+        evidence_text="你已发货",
+        observed_at=observed_at,
+    )
+
+    assert state.status is CustomerFulfillmentStatus.SHIPPED
+    assert state.shipped_at == observed_at
+    assert state.delivered_at is None
+    assert repository.is_post_delivery_human_owned("conversation-shipped") is True
+    profile = repository.find_customer_profile_by_conversation("conversation-shipped")
+    assert profile is not None
+    assert profile.fulfillment_status is CustomerFulfillmentStatus.SHIPPED
+    assert profile.shipped_at == observed_at
+
+    assert repository.restore_conversation_automation(
+        "conversation-shipped",
+        restored_at=observed_at + timedelta(minutes=1),
+    )
+    repeated = repository.record_shipped_conversation(
+        conversation_key="conversation-shipped",
+        platform_product_id="item-2",
+        evidence_key="platform-shipment-1",
+        evidence_text="你已发货",
+        observed_at=observed_at + timedelta(minutes=2),
+    )
+    assert repeated.automation_status == "active"
+
+
+def test_customer_state_is_durable_idempotent_and_kept_after_audit_cleanup(
+    tmp_path: Path,
+) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    observed_at = datetime(2026, 9, 21, 10, 0, tzinfo=UTC)
+    repository.observe_customer_summary(
+        ConversationSummary(
+            "conversation-1",
+            display_name="顾客甲",
+            platform_product_id="item-1",
+        ),
+        observed_at=observed_at,
+    )
+
+    qualified = repository.record_customer_state(
+        event_key="turn-1:classified",
+        conversation_key="conversation-1",
+        event_type="customer_turn_classified",
+        lifecycle=CustomerLifecycle.QUALIFIED,
+        intent_level=CustomerIntentLevel.MEDIUM,
+        observed_at=observed_at,
+        product_key="current-tieta-60v30ah",
+        sales_stage=SalesStage.RECOMMEND,
+        order_status=CustomerOrderStatus.CONSIDERING,
+        battery_model="60V30Ah",
+        required_range_km="50",
+        quantity=1,
+        payload={"primary_intent": "range_inquiry"},
+    )
+    duplicate = repository.record_customer_state(
+        event_key="turn-1:classified",
+        conversation_key="conversation-1",
+        event_type="customer_turn_classified",
+        lifecycle=CustomerLifecycle.ENGAGED,
+        intent_level=CustomerIntentLevel.LOW,
+        observed_at=observed_at + timedelta(seconds=1),
+    )
+    ready = repository.record_customer_state(
+        event_key="turn-2:classified",
+        conversation_key="conversation-1",
+        event_type="customer_turn_classified",
+        lifecycle=CustomerLifecycle.READY_TO_ORDER,
+        intent_level=CustomerIntentLevel.HIGH,
+        observed_at=observed_at + timedelta(minutes=1),
+        order_status=CustomerOrderStatus.PENDING_PAYMENT,
+        last_customer_offer="650",
+        accepted_price="650",
+    )
+    follow_up_at = observed_at + timedelta(minutes=31)
+    repository.mark_customer_reply_sent(
+        "conversation-1",
+        event_key="turn-2:merchant-reply",
+        sales_stage=SalesStage.CLOSE,
+        next_follow_up_at=follow_up_at,
+        sent_at=observed_at + timedelta(minutes=1),
+    )
+
+    assert qualified.battery_model == "60V30Ah"
+    assert duplicate.lifecycle is CustomerLifecycle.QUALIFIED
+    assert ready.lifecycle is CustomerLifecycle.READY_TO_ORDER
+    reopened = CustomerServiceRepository(repository.database_path)
+    profile = reopened.find_customer_profile_by_conversation("conversation-1")
+    assert profile is not None
+    assert profile.intent_level is CustomerIntentLevel.HIGH
+    assert profile.accepted_price == "650"
+    assert profile.sales_stage is SalesStage.CLOSE
+    assert profile.next_follow_up_at == follow_up_at
+    assert len(reopened.list_customer_state_events(profile.customer_key)) == 3
+
+    repository.save_sales_state(
+        SalesState(
+            conversation_key="conversation-1",
+            product_key="current-tieta-60v30ah",
+            stage=SalesStage.CLOSE,
+            follow_up_text="还需要我帮你改价吗",
+            follow_up_due_at=follow_up_at,
+            updated_at=observed_at + timedelta(minutes=1),
+        )
+    )
+    repository.cancel_sales_follow_up(
+        "conversation-1",
+        updated_at=observed_at + timedelta(minutes=2),
+    )
+    cancelled = repository.get_customer_profile(profile.customer_key)
+    assert cancelled is not None
+    assert cancelled.next_follow_up_at is None
+
+    repository.cleanup_expired_audit(
+        now=observed_at + timedelta(days=31),
+        retention=timedelta(days=15),
+    )
+    assert reopened.get_customer_profile(profile.customer_key) is not None
+    assert len(reopened.list_customer_state_events(profile.customer_key)) == 3
+
+
+def test_initialize_backfills_existing_conversations_into_customer_profiles(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "assistant.db"
+    repository = CustomerServiceRepository(database_path)
+    repository.initialize()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO cs_conversations (
+                conversation_key, display_name, platform_product_id,
+                updated_at, content_expires_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-conversation",
+                "历史顾客",
+                "item-legacy",
+                "2026-09-01T00:00:00+00:00",
+                "2026-09-16T00:00:00+00:00",
+            ),
+        )
+    repository.initialize()
+
+    profile = repository.find_customer_profile_by_conversation("legacy-conversation")
+    assert profile is not None
+    assert profile.display_name == "历史顾客"
+    assert profile.platform_product_id == "item-legacy"
 
 
 def test_import_is_idempotent_and_persists_only_redacted_content(tmp_path: Path) -> None:
@@ -148,6 +406,78 @@ def test_repository_detects_only_an_earlier_reply_job(tmp_path: Path) -> None:
     assert not repository.has_prior_reply_job("conversation-1", exclude_job_id="job-1")
     assert repository.has_prior_reply_job("conversation-1", exclude_job_id="job-2")
     assert not repository.has_prior_reply_job("conversation-2", exclude_job_id="job-2")
+
+
+def test_interrupted_jobs_are_recovered_without_blind_resend(tmp_path: Path) -> None:
+    database_path = tmp_path / "assistant.db"
+    repository = CustomerServiceRepository(database_path)
+    repository.initialize()
+    for status, suffix in (
+        (ReplyJobStatus.READING_CONTEXT, "read"),
+        (ReplyJobStatus.SENDING, "send"),
+    ):
+        repository.save_reply_draft(
+            ReplyDraft(
+                job_id=f"job-{suffix}",
+                conversation_key=f"conversation-{suffix}",
+                batch_fingerprint=f"batch-{suffix}",
+                reply_text="测试",
+                status=status,
+            )
+        )
+
+    recovered = repository.recover_interrupted_reply_jobs(
+        recovered_at=datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    )
+
+    assert recovered == 2
+    reading = repository.find_reply_draft(
+        conversation_key="conversation-read", batch_fingerprint="batch-read"
+    )
+    sending = repository.find_reply_draft(
+        conversation_key="conversation-send", batch_fingerprint="batch-send"
+    )
+    assert reading is not None and reading.status is ReplyJobStatus.FAILED
+    assert sending is not None and sending.status is ReplyJobStatus.HANDOFF
+    events = repository.list_open_handoff_events()
+    assert [event.conversation_key for event in events] == ["conversation-send"]
+
+
+def test_run_session_persists_specific_halt_reason(tmp_path: Path) -> None:
+    database_path = tmp_path / "assistant.db"
+    repository = CustomerServiceRepository(database_path)
+    repository.initialize()
+    started_at = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    run_id = repository.start_run_session(
+        mode="auto_send",
+        started_at=started_at,
+    )
+    repository.finish_run_session(
+        run_id,
+        status="halted",
+        stopped_at=started_at + timedelta(minutes=1),
+        stop_reason="闲鱼登录已失效，客服已暂停。",
+        failure_category="page_health",
+        failure_stage="customer_service_thread",
+        exception_type="LoginRequired",
+    )
+
+    with sqlite3.connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT status, stop_reason, failure_category,
+                   failure_stage, exception_type
+            FROM cs_run_sessions WHERE id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    assert row == (
+        "halted",
+        "闲鱼登录已失效，客服已暂停。",
+        "page_health",
+        "customer_service_thread",
+        "LoginRequired",
+    )
 
 
 def test_negotiation_state_round_trip_survives_repository_recreation(tmp_path: Path) -> None:
@@ -304,11 +634,21 @@ def test_handoff_notification_is_deduplicated_and_can_release_conversation(
     events = repository.list_open_handoff_events()
     assert len(events) == 1
     assert events[0].reason == "涉及售后争议"
+    profile = repository.find_customer_profile_by_conversation("conversation-1")
+    assert profile is not None
+    assert profile.automation_status == "human_owned"
+    assert [
+        event.event_type
+        for event in repository.list_customer_state_events(profile.customer_key)
+    ] == ["handoff_opened"]
 
     assert repository.resolve_handoff_event(events[0].event_id) is True
     assert repository.resolve_handoff_event(events[0].event_id) is False
     assert repository.has_open_handoff("conversation-1") is False
     assert repository.list_open_handoff_events() == []
+    released = repository.get_customer_profile(profile.customer_key)
+    assert released is not None
+    assert released.automation_status == "active"
 
 
 def test_customer_turn_version_and_send_reservation_are_atomic(tmp_path: Path) -> None:

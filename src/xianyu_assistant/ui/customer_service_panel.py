@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import datetime
 
 from PyQt6.QtCore import QSignalBlocker, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -49,6 +51,8 @@ from xianyu_assistant.customer_service.price_change import PricePolicyError, che
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 from xianyu_assistant.security.credential_store import CredentialStore, KeyringCredentialStore
 
+logger = logging.getLogger(__name__)
+
 
 class CustomerServiceRunThread(QThread):
     """Own the synchronous Playwright and customer-service worker resources."""
@@ -80,7 +84,16 @@ class CustomerServiceRunThread(QThread):
     def run(self) -> None:
         """Attach, health-check, and poll until the UI asks the run to stop."""
         manager = BrowserManager(self._browser_config)
+        run_id: int | None = None
+        final_status = ReceptionStatus.HALTED.value
+        final_reason: str | None = None
+        failure_category: str | None = None
+        exception_type: str | None = None
         try:
+            run_id = self._repository.start_run_session(
+                mode=self._mode.value,
+                started_at=datetime.now().astimezone(),
+            )
             manager.connect()
             settings = _deepseek_settings(self._repository)
             credential_store = self._credential_store or KeyringCredentialStore()
@@ -99,6 +112,10 @@ class CustomerServiceRunThread(QThread):
             status = engine.start()
             self.status_changed.emit(status.value)
             if status is not ReceptionStatus.RUNNING:
+                final_status = status.value
+                final_reason = engine.stop_reason or "客服页启动健康检查未通过。"
+                failure_category = "page_health"
+                self.run_error.emit(final_reason)
                 return
             while not self._stop_requested.is_set() and engine.status is ReceptionStatus.RUNNING:
                 engine.run_once()
@@ -106,11 +123,33 @@ class CustomerServiceRunThread(QThread):
                 self._stop_requested.wait(CustomerServiceConfig().poll_interval_seconds)
             if engine.status is ReceptionStatus.RUNNING:
                 engine.stop("用户停止")
-            self.status_changed.emit(engine.status.value)
-        except Exception as error:  # noqa: BLE001 - surface a redacted, bounded UI error
-            self.run_error.emit(_safe_error_message(error))
+            final_status = engine.status.value
+            final_reason = engine.stop_reason
+            self.status_changed.emit(final_status)
+            if engine.status is ReceptionStatus.HALTED:
+                failure_category = "runtime_safety"
+                self.run_error.emit(final_reason or "客服运行已安全暂停。")
+        except Exception as error:
+            logger.exception("客服接待线程异常退出。")
+            final_reason = _safe_error_message(error)
+            failure_category = "runtime_exception"
+            exception_type = error.__class__.__name__
             self.status_changed.emit(ReceptionStatus.HALTED.value)
+            self.run_error.emit(final_reason)
         finally:
+            if run_id is not None:
+                try:
+                    self._repository.finish_run_session(
+                        run_id,
+                        status=final_status,
+                        stopped_at=datetime.now().astimezone(),
+                        stop_reason=final_reason,
+                        failure_category=failure_category,
+                        failure_stage="customer_service_thread",
+                        exception_type=exception_type,
+                    )
+                except Exception:
+                    logger.exception("客服运行停止原因保存失败。")
             with self._engine_lock:
                 self._engine = None
             manager.disconnect()
@@ -406,8 +445,12 @@ class CustomerServicePanel(QWidget):
         )
         self.resolve_handoff_button = QPushButton("已处理，恢复该顾客")
         self.resolve_handoff_button.setEnabled(False)
+        self.restore_delivery_button = QPushButton("恢复该会话自动接待")
+        self.restore_delivery_button.setEnabled(False)
+        self.restore_delivery_button.setVisible(False)
         handoff_actions = QHBoxLayout()
         handoff_actions.addWidget(self.resolve_handoff_button)
+        handoff_actions.addWidget(self.restore_delivery_button)
         handoff_actions.addStretch()
         self.handoff_empty_state = self._build_table_empty_state(
             "暂无转人工通知",
@@ -483,6 +526,9 @@ class CustomerServicePanel(QWidget):
         self.stop_button.clicked.connect(self.stop_reception)
         self.handoff_table.itemSelectionChanged.connect(self._handoff_selected)
         self.resolve_handoff_button.clicked.connect(self.resolve_selected_handoff)
+        self.restore_delivery_button.clicked.connect(
+            self.restore_selected_delivery_conversation
+        )
         self.draft_table.itemSelectionChanged.connect(self._draft_selected)
         self.save_edit_button.clicked.connect(self.save_draft_edit)
         self.confirm_button.clicked.connect(self.confirm_selected_draft)
@@ -780,6 +826,18 @@ class CustomerServicePanel(QWidget):
                 )
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, event.event_id)
+                    item.setData(
+                        int(Qt.ItemDataRole.UserRole) + 1,
+                        event.conversation_key,
+                    )
+                    item.setData(
+                        int(Qt.ItemDataRole.UserRole) + 2,
+                        event.handoff_type,
+                    )
+                    item.setData(
+                        int(Qt.ItemDataRole.UserRole) + 3,
+                        event.status,
+                    )
                 self.handoff_table.setItem(row, column, item)
             if event.event_id == selected_event_id:
                 self.handoff_table.selectRow(row)
@@ -790,8 +848,8 @@ class CustomerServicePanel(QWidget):
         )
         self.handoff_group.setTitle(f"转人工通知 · {count}")
         self.handoff_hint.setText(
-            f"程序内提醒 · 待处理 {count} 条\n"
-            "列表中的顾客暂停自动回复；其他顾客照常接待。"
+            f"程序内提醒 · 待处理 {count} 条（含持续人工锁）\n"
+            "已发货会话关闭提醒后仍保持人工；其他顾客照常接待。"
         )
         self._handoff_selected()
 
@@ -801,12 +859,43 @@ class CustomerServicePanel(QWidget):
         if event_id is None:
             self._set_status("请先选择一条转人工通知。", error=True)
             return
+        selected = self._selected_handoff_metadata()
+        if selected is None:
+            self._set_status("请先选择一条转人工通知。", error=True)
+            return
+        _conversation_key, handoff_type, status = selected
+        if status != "open":
+            self._set_status("本次消息已经标记为人工处理。")
+            return
         if not self.repository.resolve_handoff_event(event_id):
             self._set_status("该转人工通知已处理或不存在。", error=True)
             self.refresh_handoffs()
             return
         self.refresh_handoffs()
-        self._set_status("已标记人工处理完成；该顾客后续新消息将恢复自动处理。")
+        if handoff_type == "post_delivery":
+            self._set_status("已处理本次消息；已发货会话仍保持人工接待。")
+        else:
+            self._set_status("已标记人工处理完成；该顾客后续新消息将恢复自动处理。")
+
+    def restore_selected_delivery_conversation(self) -> None:
+        """Explicitly release one sticky post-delivery conversation lock."""
+        selected = self._selected_handoff_metadata()
+        if selected is None:
+            self._set_status("请先选择一条已发货会话。", error=True)
+            return
+        conversation_key, handoff_type, _status = selected
+        if handoff_type != "post_delivery":
+            self._set_status("当前通知不是已发货会话。", error=True)
+            return
+        if not self.repository.restore_conversation_automation(
+            conversation_key,
+            restored_at=datetime.now().astimezone(),
+        ):
+            self._set_status("该会话已恢复或发货后人工锁不存在。", error=True)
+            self.refresh_handoffs()
+            return
+        self.refresh_handoffs()
+        self._set_status("已明确恢复该已发货会话的自动接待。")
 
     def save_draft_edit(self) -> None:
         """Persist a validated edit while keeping the draft in review status."""
@@ -870,8 +959,38 @@ class CustomerServicePanel(QWidget):
         value = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         return int(value) if isinstance(value, int) else None
 
+    def _selected_handoff_metadata(self) -> tuple[str, str, str] | None:
+        row = self.handoff_table.currentRow()
+        if row < 0:
+            return None
+        item = self.handoff_table.item(row, 0)
+        if item is None:
+            return None
+        conversation_key = item.data(int(Qt.ItemDataRole.UserRole) + 1)
+        handoff_type = item.data(int(Qt.ItemDataRole.UserRole) + 2)
+        status = item.data(int(Qt.ItemDataRole.UserRole) + 3)
+        if not all(isinstance(value, str) for value in (conversation_key, handoff_type, status)):
+            return None
+        return str(conversation_key), str(handoff_type), str(status)
+
     def _handoff_selected(self) -> None:
-        self.resolve_handoff_button.setEnabled(self._selected_handoff_event_id() is not None)
+        selected = self._selected_handoff_metadata()
+        if selected is None:
+            self.resolve_handoff_button.setEnabled(False)
+            self.resolve_handoff_button.setText("已处理，恢复该顾客")
+            self.restore_delivery_button.setEnabled(False)
+            self.restore_delivery_button.setVisible(False)
+            return
+        _conversation_key, handoff_type, status = selected
+        post_delivery = handoff_type == "post_delivery"
+        self.resolve_handoff_button.setText(
+            "已处理本次消息（保持人工）"
+            if post_delivery
+            else "已处理，恢复该顾客"
+        )
+        self.resolve_handoff_button.setEnabled(status == "open")
+        self.restore_delivery_button.setVisible(post_delivery)
+        self.restore_delivery_button.setEnabled(post_delivery)
 
     def _selected_price_change(self) -> PriceChangeDraft | None:
         if self._selected_price_task_id is None:

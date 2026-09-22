@@ -25,6 +25,8 @@ class CatalogRepository(Protocol):
 CATALOG_VERSION = "iron-tower-2026-09-20-v6-6030-range"
 
 BLUETOOTH_UPGRADE_AMOUNT = "20.00"
+FIRST_CONTACT_MESSAGE_SETTING = "first_contact_message"
+MAX_FIRST_CONTACT_MESSAGE_LENGTH = 1_000
 
 NEGOTIATION_OPENING_COUNTERS = {
     "current-tieta-60v20ah": "388.00",

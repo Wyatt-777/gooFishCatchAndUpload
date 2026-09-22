@@ -102,3 +102,65 @@ def test_recent_identical_nudge_is_not_repeated() -> None:
     )
 
     assert plan.proposal.reply_text == "398元"
+
+
+def test_charger_compatibility_does_not_append_generic_qualification() -> None:
+    messages = (
+        ChatMessage("m1", MessageDirection.INCOMING, MessageKind.TEXT, "二轮的"),
+        ChatMessage("m2", MessageDirection.INCOMING, MessageKind.TEXT, "送的匹配是吧"),
+    )
+
+    plan = build_sales_plan(
+        "送的匹配是吧",
+        ReplyProposal("对 送的配你原车口", intent="unknown"),
+        None,
+        messages,
+        negotiation_active=False,
+    )
+
+    assert plan.proposal.reply_text == "对 送的配你原车口"
+    assert plan.stage is SalesStage.PAUSED
+    assert plan.follow_up_text is None
+
+
+def test_shipping_confirmation_does_not_restart_product_qualification() -> None:
+    plan = build_sales_plan(
+        "好的",
+        ReplyProposal("好的 准备给你发货", intent="unknown"),
+        _product(),
+        _incoming("好的"),
+        negotiation_active=False,
+    )
+
+    assert plan.proposal.reply_text == "好的 准备给你发货"
+    assert plan.stage is SalesStage.PAUSED
+    assert plan.follow_up_text is None
+
+
+def test_specific_product_fact_question_is_answered_without_generic_sales_question() -> None:
+    plan = build_sales_plan(
+        "6030尺寸多大",
+        ReplyProposal("6030尺寸17-18-32", intent="unknown"),
+        _product(),
+        _incoming("6030尺寸多大"),
+        negotiation_active=False,
+    )
+
+    assert plan.proposal.reply_text == "6030尺寸17-18-32"
+    assert plan.stage is SalesStage.PAUSED
+    assert plan.follow_up_text is None
+
+
+def test_qualification_is_not_restarted_after_both_questions_were_already_asked() -> None:
+    plan = build_sales_plan(
+        "多少钱",
+        ReplyProposal("398元", intent="price"),
+        _product(),
+        _incoming("多少钱"),
+        negotiation_active=False,
+        recent_merchant_replies=("你是二轮还是三轮？平时想跑多少公里",),
+    )
+
+    assert plan.proposal.reply_text == "398元"
+    assert plan.stage is SalesStage.PAUSED
+    assert plan.follow_up_text is None

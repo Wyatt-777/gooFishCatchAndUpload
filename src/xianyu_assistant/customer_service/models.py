@@ -69,6 +69,55 @@ class SalesStage(StrEnum):
     PAUSED = "paused"
 
 
+class CustomerLifecycle(StrEnum):
+    """Long-lived commercial state for one customer profile."""
+
+    NEW = "new"
+    ENGAGED = "engaged"
+    QUALIFIED = "qualified"
+    NEGOTIATING = "negotiating"
+    READY_TO_ORDER = "ready_to_order"
+    ORDERED = "ordered"
+    AFTER_SALES = "after_sales"
+    LOST = "lost"
+
+
+class CustomerIntentLevel(StrEnum):
+    """Deterministic purchase-intent strength, never guessed by free-form text."""
+
+    UNKNOWN = "unknown"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class CustomerOrderStatus(StrEnum):
+    """Order progress known from chat; unknown platform facts remain unset."""
+
+    NONE = "none"
+    CONSIDERING = "considering"
+    READY = "ready"
+    PENDING_PAYMENT = "pending_payment"
+    ORDERED = "ordered"
+    AFTER_SALES = "after_sales"
+
+
+class CustomerFulfillmentStatus(StrEnum):
+    """Platform-confirmed fulfillment progress, separate from sales intent."""
+
+    UNKNOWN = "unknown"
+    PENDING_SHIPMENT = "pending_shipment"
+    SHIPPED = "shipped"
+    DELIVERED = "delivered"
+
+
+class PlatformSystemEventKind(StrEnum):
+    """Trusted platform events rendered outside customer/merchant messages."""
+
+    ORDER_SHIPPED = "order_shipped"
+    ORDER_DELIVERED = "order_delivered"
+
+
 class MessageDirection(StrEnum):
     """Whether a message was sent by the customer or the merchant."""
 
@@ -115,6 +164,7 @@ class CustomerServiceConfig:
     max_model_attempts: int = 2
     max_send_failures: int = 3
     max_model_failures: int = 3
+    max_page_health_failures: int = 3
     sales_follow_up_delay_minutes: int = 30
     sales_follow_up_start_hour: int = 9
     sales_follow_up_end_hour: int = 22
@@ -133,6 +183,7 @@ class CustomerServiceConfig:
             "max_model_attempts",
             "max_send_failures",
             "max_model_failures",
+            "max_page_health_failures",
             "sales_follow_up_delay_minutes",
         )
         for field_name in positive_fields:
@@ -202,6 +253,21 @@ class ChatMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class PlatformSystemEvent:
+    """A platform-authored timeline event which must never enter model chat text."""
+
+    event_key: str
+    kind: PlatformSystemEventKind
+    text: str
+
+    def __post_init__(self) -> None:
+        if not self.event_key.strip() or not self.text.strip():
+            raise ValueError("平台系统事件必须包含事件键和文本。")
+        if not isinstance(self.kind, PlatformSystemEventKind):
+            object.__setattr__(self, "kind", PlatformSystemEventKind(self.kind))
+
+
+@dataclass(frozen=True, slots=True)
 class ConversationSnapshot:
     """The minimum page snapshot needed before generating or sending a reply."""
 
@@ -210,11 +276,13 @@ class ConversationSnapshot:
     platform_product_id: str | None = None
     product_title: str | None = None
     product_url: str | None = None
+    system_events: tuple[PlatformSystemEvent, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.conversation_key.strip():
             raise ValueError("conversation_key 不能为空。")
         object.__setattr__(self, "messages", tuple(self.messages))
+        object.__setattr__(self, "system_events", tuple(self.system_events))
 
     @property
     def last_message(self) -> ChatMessage | None:
@@ -233,6 +301,22 @@ class ConversationSnapshot:
     def last_message_from_customer(self) -> bool:
         """Whether sending is eligible based on the current final message."""
         return self.last_message is not None and self.last_message.direction is MessageDirection.INCOMING
+
+    @property
+    def order_delivered(self) -> bool:
+        """Whether the platform timeline confirms that this order was delivered."""
+        return any(
+            event.kind is PlatformSystemEventKind.ORDER_DELIVERED
+            for event in self.system_events
+        )
+
+    @property
+    def order_shipped(self) -> bool:
+        """Whether the platform timeline confirms that the merchant shipped."""
+        return any(
+            event.kind is PlatformSystemEventKind.ORDER_SHIPPED
+            for event in self.system_events
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +438,105 @@ class SalesState:
 
 
 @dataclass(frozen=True, slots=True)
+class CustomerProfile:
+    """Durable customer state independent from expiring message content."""
+
+    customer_key: str
+    primary_conversation_key: str
+    platform_customer_id: str | None = None
+    display_name: str | None = None
+    lifecycle: CustomerLifecycle = CustomerLifecycle.NEW
+    intent_level: CustomerIntentLevel = CustomerIntentLevel.UNKNOWN
+    sales_stage: SalesStage | None = None
+    order_status: CustomerOrderStatus = CustomerOrderStatus.NONE
+    fulfillment_status: CustomerFulfillmentStatus = CustomerFulfillmentStatus.UNKNOWN
+    shipped_at: datetime | None = None
+    delivered_at: datetime | None = None
+    automation_status: str = "active"
+    current_product_key: str | None = None
+    platform_product_id: str | None = None
+    battery_model: str | None = None
+    required_range_km: str | None = None
+    motor_power_w: str | None = None
+    quantity: int = 1
+    budget_amount: str | None = None
+    last_customer_offer: str | None = None
+    accepted_price: str | None = None
+    tags: tuple[str, ...] = ()
+    notes: str = ""
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    last_customer_message_at: datetime | None = None
+    last_merchant_message_at: datetime | None = None
+    next_follow_up_at: datetime | None = None
+    conversation_count: int = 1
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.customer_key.strip() or not self.primary_conversation_key.strip():
+            raise ValueError("顾客档案必须包含顾客键和主会话键。")
+        if not isinstance(self.lifecycle, CustomerLifecycle):
+            object.__setattr__(self, "lifecycle", CustomerLifecycle(self.lifecycle))
+        if not isinstance(self.intent_level, CustomerIntentLevel):
+            object.__setattr__(self, "intent_level", CustomerIntentLevel(self.intent_level))
+        if self.sales_stage is not None and not isinstance(self.sales_stage, SalesStage):
+            object.__setattr__(self, "sales_stage", SalesStage(self.sales_stage))
+        if not isinstance(self.order_status, CustomerOrderStatus):
+            object.__setattr__(self, "order_status", CustomerOrderStatus(self.order_status))
+        if not isinstance(self.fulfillment_status, CustomerFulfillmentStatus):
+            object.__setattr__(
+                self,
+                "fulfillment_status",
+                CustomerFulfillmentStatus(self.fulfillment_status),
+            )
+        if self.automation_status not in {"active", "human_owned", "paused"}:
+            raise ValueError("顾客自动接待状态无效。")
+        if self.quantity < 1:
+            raise ValueError("顾客意向数量必须大于零。")
+        if self.conversation_count < 1:
+            raise ValueError("顾客会话数量必须大于零。")
+        object.__setattr__(self, "tags", tuple(dict.fromkeys(self.tags)))
+
+
+@dataclass(frozen=True, slots=True)
+class CustomerStateEvent:
+    """Append-only audit event for a durable customer state transition."""
+
+    event_key: str
+    customer_key: str
+    conversation_key: str
+    event_type: str
+    from_lifecycle: CustomerLifecycle | None
+    to_lifecycle: CustomerLifecycle
+    payload_json: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationFulfillmentState:
+    """Durable platform fulfillment and post-shipment automation lock."""
+
+    conversation_key: str
+    status: CustomerFulfillmentStatus
+    platform_product_id: str | None = None
+    evidence_key: str | None = None
+    evidence_text: str | None = None
+    shipped_at: datetime | None = None
+    delivered_at: datetime | None = None
+    automation_status: str = "active"
+    updated_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if not self.conversation_key.strip():
+            raise ValueError("履约状态必须绑定会话。")
+        if not isinstance(self.status, CustomerFulfillmentStatus):
+            object.__setattr__(self, "status", CustomerFulfillmentStatus(self.status))
+        if self.automation_status not in {"active", "human_owned"}:
+            raise ValueError("履约自动接待状态无效。")
+
+
+@dataclass(frozen=True, slots=True)
 class ReplyDraft:
     """A locally validated draft waiting for human confirmation or sending."""
 
@@ -411,12 +594,16 @@ class HandoffEvent:
     reason: str
     status: str
     created_at: datetime
+    handoff_type: str = "general"
+    release_on_resolve: bool = True
 
     def __post_init__(self) -> None:
         if self.event_id <= 0:
             raise ValueError("event_id 必须大于 0。")
         if not self.conversation_key.strip() or not self.reason.strip():
             raise ValueError("转人工通知必须包含会话和原因。")
+        if self.handoff_type not in {"general", "post_delivery"}:
+            raise ValueError("转人工通知类型无效。")
 
 
 @dataclass(frozen=True, slots=True)
