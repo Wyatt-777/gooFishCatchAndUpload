@@ -7,6 +7,7 @@ import os
 import sys
 import traceback
 from collections.abc import Sequence
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -404,8 +405,10 @@ def _configure_logging() -> None:
     log_directory = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "XianyuAssistant"
     try:
         log_directory.mkdir(parents=True, exist_ok=True)
-        handler: logging.Handler = logging.FileHandler(
+        handler: logging.Handler = RotatingFileHandler(
             log_directory / "xianyu_assistant.log",
+            maxBytes=5_000_000,
+            backupCount=3,
             encoding="utf-8",
         )
     except OSError:

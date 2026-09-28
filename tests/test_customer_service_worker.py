@@ -10,12 +10,14 @@ from xianyu_assistant.customer_service.current_catalog import (
     CURRENT_PRODUCTS,
     FIRST_CONTACT_CATALOG_REPLY,
     FIRST_CONTACT_MESSAGE_SETTING,
+    PRICE_SILENCE_FOLLOW_UP_SETTING,
     install_current_catalog,
 )
 from xianyu_assistant.customer_service.customer_service_worker import (
     CustomerServiceWorker,
     _classify_customer_state,
     _current_operating_policy_reply,
+    _listing_teaser_reply,
     parse_reply_proposal,
 )
 from xianyu_assistant.customer_service.models import (
@@ -150,6 +152,12 @@ class FailingSendAdapter(FakeAdapter):
     def send_text(self, text: str) -> SendReceipt:
         del text
         raise RuntimeError("send failed")
+
+
+class UnconfirmedSendAdapter(FakeAdapter):
+    def verify_outgoing(self, receipt: SendReceipt) -> bool:
+        del receipt
+        return False
 
 
 class AutoPriceAdapter(FakeAdapter):
@@ -746,15 +754,19 @@ def test_shipment_appearing_during_review_discards_draft_and_hands_off() -> None
     assert repository.handoffs
 
 
-def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> None:
+def test_auto_fit_follow_up_is_persisted_and_sent_once_after_30_minutes() -> None:
     clock = FakeClock()
     clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
-    adapter = FakeAdapter({"c1": _snapshot("c1", "这个电池多少钱")})
-    repository = FakeRepository()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "6030价格和续航怎么样"),
+    )})
+    repository = FirstContactRepository()
     worker = CustomerServiceWorker(
         adapter,
         repository,
-        FakeModel(),
+        FakeModel("99元"),
         config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
         clock=clock,
     )
@@ -771,7 +783,7 @@ def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> N
 
     adapter.snapshots["c1"] = _dialog_snapshot(
         "c1",
-        (MessageDirection.INCOMING, "这个电池多少钱"),
+        (MessageDirection.INCOMING, "6030价格和续航怎么样"),
         (MessageDirection.OUTGOING, first_sent),
     )
     last = adapter.snapshots["c1"].messages[-1]
@@ -795,7 +807,8 @@ def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> N
     worker.run_once()
 
     assert len(adapter.sent) == 2
-    assert "二轮还是三轮" in adapter.sent[-1]
+    assert "车型" in adapter.sent[-1]
+    assert "二轮还是三轮" not in adapter.sent[-1]
     assert repository.sales_states["c1"].status == "followed_up"
     assert repository.sales_states["c1"].follow_up_count == 1
 
@@ -807,12 +820,16 @@ def test_auto_sales_follow_up_is_persisted_and_sent_once_after_30_minutes() -> N
 def test_due_sales_follow_up_is_cancelled_if_customer_has_replied() -> None:
     clock = FakeClock()
     clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
-    adapter = FakeAdapter({"c1": _snapshot("c1", "这个电池多少钱")})
-    repository = FakeRepository()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "6030价格和续航怎么样"),
+    )})
+    repository = FirstContactRepository()
     worker = CustomerServiceWorker(
         adapter,
         repository,
-        FakeModel(),
+        FakeModel("99元"),
         config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
         clock=clock,
     )
@@ -824,7 +841,7 @@ def test_due_sales_follow_up_is_cancelled_if_customer_has_replied() -> None:
 
     adapter.snapshots["c1"] = _dialog_snapshot(
         "c1",
-        (MessageDirection.INCOMING, "这个电池多少钱"),
+        (MessageDirection.INCOMING, "6030价格和续航怎么样"),
         (MessageDirection.OUTGOING, first_sent),
         (MessageDirection.INCOMING, "我是二轮车"),
     )
@@ -834,6 +851,62 @@ def test_due_sales_follow_up_is_cancelled_if_customer_has_replied() -> None:
 
     assert adapter.sent == [first_sent]
     assert repository.sales_states["c1"].status == "cancelled"
+
+
+def test_old_persisted_vehicle_follow_up_is_cancelled_after_upgrade() -> None:
+    clock = FakeClock()
+    clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    adapter = FakeAdapter({"c1": ConversationSnapshot(
+        "c1",
+        (ChatMessage(
+            "m1", MessageDirection.OUTGOING, MessageKind.TEXT, "有的",
+            content_fingerprint="有的",
+        ),),
+    )})
+    adapter.summaries = []
+    repository = FakeRepository()
+    repository.sales_states["c1"] = SalesState(
+        conversation_key="c1",
+        product_key="p1",
+        stage=SalesStage.QUALIFY,
+        follow_up_text="你是二轮还是三轮？我再帮你核下适配和续航",
+        follow_up_due_at=clock.now(),
+        last_merchant_fingerprint="有的",
+    )
+    worker = CustomerServiceWorker(
+        adapter, repository, FakeModel(),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND), clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+
+    assert adapter.sent == []
+    assert repository.sales_states["c1"].status == "cancelled"
+
+
+def test_model_generated_vehicle_nudge_is_removed_from_price_reply() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "6030多少钱"),
+    )})
+    repository = FirstContactRepository()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("99元\n你是二轮还是三轮？我再帮你核下适配和续航"),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent == ["99元"]
 
 
 def test_worker_debounces_then_creates_human_review_draft() -> None:
@@ -965,6 +1038,440 @@ def test_first_customer_conversation_uses_editable_saved_message() -> None:
     assert adapter.sent[0].startswith(custom_message)
     assert not adapter.sent[0].startswith(FIRST_CONTACT_CATALOG_REPLY)
     assert repository.first_contact["c1"][1] == "sent"
+
+
+def test_unspecified_price_questions_use_saved_message_after_first_contact() -> None:
+    for question in ("实价吗", "这个多少钱"):
+        clock = FakeClock()
+        repository = FirstContactRepository()
+        repository.settings[FIRST_CONTACT_MESSAGE_SETTING] = "已保存的型号价格话术"
+        adapter = FakeAdapter(
+            {"c1": _dialog_snapshot(
+                "c1",
+                (MessageDirection.OUTGOING, "有的"),
+                (MessageDirection.INCOMING, question),
+            )}
+        )
+        model = FakeModel("对 实价")
+        worker = _worker(adapter, clock, repository, model)
+
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+
+        assert worker.drafts.list()[-1].reply_text == "已保存的型号价格话术"
+        assert model.calls == 0
+
+
+def test_listing_price_question_explains_low_capacity_variant() -> None:
+    for question in ("标价多少", "页面活动价是什么意思", "240元是哪一种"):
+        clock = FakeClock()
+        repository = FirstContactRepository()
+        repository.product = CURRENT_PRODUCTS[0]
+        repository.settings[FIRST_CONTACT_MESSAGE_SETTING] = "已保存的型号价格话术"
+        adapter = FakeAdapter({"c1": _dialog_snapshot(
+            "c1",
+            (MessageDirection.OUTGOING, "有的"),
+            (MessageDirection.INCOMING, question),
+        )})
+        model = FakeModel("你是二轮还是三轮？我再帮你核下适配和续航")
+        worker = CustomerServiceWorker(
+            adapter,
+            repository,
+            model,
+            config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+            clock=clock,
+        )
+
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+
+        assert adapter.sent == ["页面标价对应低容量款，续航比较低"]
+        assert model.calls == 0
+
+
+def test_explicit_model_listed_price_is_not_mistaken_for_teaser_variant() -> None:
+    assert _listing_teaser_reply(
+        "6030标价多少", "6030标价多少", knowledge=CURRENT_PRODUCTS[0]
+    ) is None
+
+
+def test_listing_teaser_rule_covers_every_current_product_without_fixed_amount() -> None:
+    for product, shown_price in zip(CURRENT_PRODUCTS, ("500", "300", "400"), strict=True):
+        for question in (f"{shown_price}元是哪款", f"{shown_price}是哪种", "页面活动价是哪款"):
+            proposal = _listing_teaser_reply(
+                question,
+                question,
+                knowledge=product,
+                displayed_price=shown_price,
+            )
+            assert proposal is not None
+            assert "低容量款，续航比较低" in proposal.reply_text
+
+
+def test_all_current_products_explain_their_own_lower_page_price() -> None:
+    for product, shown_price in zip(CURRENT_PRODUCTS, ("500", "300", "400"), strict=True):
+        clock = FakeClock()
+        repository = FirstContactRepository()
+        repository.product = product
+        base = _dialog_snapshot(
+            "c1",
+            (MessageDirection.OUTGOING, "有的"),
+            (MessageDirection.INCOMING, f"{shown_price}元是哪一种"),
+        )
+        adapter = FakeAdapter({"c1": ConversationSnapshot(
+            base.conversation_key,
+            base.messages,
+            platform_product_id=base.platform_product_id,
+            product_title=base.product_title,
+            displayed_listing_price=shown_price,
+        )})
+        worker = CustomerServiceWorker(
+            adapter, repository, FakeModel("这要看车型"),
+            config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND), clock=clock,
+        )
+
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+
+        assert len(adapter.sent) == 1
+        assert "低容量款，续航比较低" in adapter.sent[0]
+        assert repository.negotiation_states == {}
+
+
+def test_listing_teaser_does_not_override_real_quote_or_negotiation() -> None:
+    product = CURRENT_PRODUCTS[0]
+    merchant_quote = (ChatMessage(
+        "m1", MessageDirection.OUTGOING, MessageKind.TEXT, "658元",
+    ),)
+    assert _listing_teaser_reply(
+        "658元是哪款", "658元是哪款", knowledge=product, messages=merchant_quote,
+    ) is None
+    assert _listing_teaser_reply(
+        "500元能卖吗", "500元能卖吗", knowledge=product, displayed_price="500",
+    ) is None
+    assert _listing_teaser_reply(
+        "500元是哪款", "500元是哪款", knowledge=product, displayed_price="240",
+    ) is None
+    assert _listing_teaser_reply(
+        "标价多少", "标价多少", knowledge=product, displayed_price=product.listed_price,
+    ) is None
+
+
+def test_unmatched_listing_price_is_handed_off_instead_of_guessing_a_model() -> None:
+    proposal = _listing_teaser_reply(
+        "页面活动价是哪款", "页面活动价是哪款",
+        knowledge=None, displayed_price="240",
+    )
+
+    assert proposal is not None
+    assert proposal.requires_handoff is True
+    assert "低容量" not in proposal.reply_text
+
+
+def test_screenshot_listing_price_follow_up_is_not_a_new_6030_offer() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    repository.product = next(
+        item for item in CURRENT_PRODUCTS if item.product_key == "current-tieta-60v30ah"
+    )
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.INCOMING, "60伏30安时多少钱"),
+        (MessageDirection.OUTGOING, "658元"),
+        (MessageDirection.INCOMING, "240元是哪一种"),
+    )})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("你是二轮还是三轮？我再帮你核下适配和续航"),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert len(adapter.sent) == 1
+    assert "低容量款，续航比较低" in adapter.sent[0]
+    assert "二轮还是三轮" not in adapter.sent[0]
+    assert repository.negotiation_states == {}
+
+
+def test_explicit_price_offer_is_not_replaced_by_saved_catalog_message() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    repository.settings[FIRST_CONTACT_MESSAGE_SETTING] = "已保存的型号价格话术"
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "90元能便宜点吗"),
+    )})
+    worker = _worker(adapter, clock, repository, FakeModel("可以，90元"))
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert worker.drafts.list()[-1].reply_text != "已保存的型号价格话术"
+
+
+def test_spaced_model_answer_after_model_question_is_recognized() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    adapter = FakeAdapter(
+        {"c1": _dialog_snapshot(
+            "c1",
+            (MessageDirection.INCOMING, "容量还有多少"),
+            (MessageDirection.OUTGOING, "你要哪个型号"),
+            (MessageDirection.INCOMING, "60 30"),
+        )}
+    )
+    model = FakeModel("好的，您说的是60V30Ah型号")
+    worker = _worker(adapter, clock, repository, model)
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert worker.drafts.list()[-1].reply_text == "好的，您说的是60V30Ah型号"
+    assert model.calls == 1
+    prompt = json.loads(model.last_user_prompt or "{}")
+    assert prompt["resolved_customer_query"] == "6030 60V30Ah 容量和健康度"
+    assert prompt["customer_semantics"]["entities"]["battery_model"] == "60V30Ah"
+
+
+def test_checkout_guidance_switch_changes_only_opted_in_run() -> None:
+    for enabled in (False, True):
+        clock = FakeClock()
+        repository = FirstContactRepository()
+        repository.product = next(
+            product for product in CURRENT_PRODUCTS if product.product_key == "current-tieta-60v20ah"
+        )
+        adapter = FakeAdapter({"c1": _dialog_snapshot(
+            "c1",
+            (MessageDirection.OUTGOING, "6020 398元"),
+            (MessageDirection.INCOMING, "6020怎么拍"),
+        )})
+        worker = CustomerServiceWorker(
+            adapter,
+            repository,
+            FakeModel("可以"),
+            config=CustomerServiceConfig(
+                mode=ReceptionMode.AUTO_SEND,
+                checkout_guidance_enabled=enabled,
+            ),
+            clock=clock,
+        )
+
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+
+        assert adapter.sent == ["可以\n在这个链接拍就行" if enabled else "可以"]
+
+
+def test_checkout_guidance_does_not_follow_up_after_saved_price_message() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    repository.settings[FIRST_CONTACT_MESSAGE_SETTING] = "已保存的型号价格话术"
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "实价吗"),
+    )})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("对 实价"),
+        config=CustomerServiceConfig(
+            mode=ReceptionMode.AUTO_SEND,
+            checkout_guidance_enabled=True,
+        ),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent == ["已保存的型号价格话术"]
+    assert repository.sales_states == {}
+
+
+def test_checkout_guidance_schedules_followup_for_unanswered_buying_question() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "我想买一组"),
+    )})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("可以"),
+        config=CustomerServiceConfig(
+            mode=ReceptionMode.AUTO_SEND,
+            checkout_guidance_enabled=True,
+        ),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent == ["可以\n你要哪个型号"]
+    assert repository.sales_states["c1"].follow_up_text == "型号发我下 我帮你确认"
+    assert repository.sales_states["c1"].follow_up_count == 0
+
+
+def test_configured_price_silence_message_is_sent_once_after_30_minutes() -> None:
+    clock = FakeClock()
+    clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+    repository = FirstContactRepository()
+    repository.settings[PRICE_SILENCE_FOLLOW_UP_SETTING] = "刚才的价格还有疑问吗？"
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "有的"),
+        (MessageDirection.INCOMING, "6030多少钱"),
+    )})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("99元"),
+        config=CustomerServiceConfig(
+            mode=ReceptionMode.AUTO_SEND,
+            checkout_guidance_enabled=True,
+        ),
+        clock=clock,
+    )
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent == ["99元"]
+    assert repository.sales_states["c1"].stage is SalesStage.PRICE_FOLLOW_UP
+    assert repository.sales_states["c1"].follow_up_text == "刚才的价格还有疑问吗？"
+
+    adapter.snapshots["c1"] = ConversationSnapshot(
+        "c1",
+        (
+            ChatMessage("m1", MessageDirection.INCOMING, MessageKind.TEXT, "6030多少钱"),
+            ChatMessage(
+                "m2", MessageDirection.OUTGOING, MessageKind.TEXT, "99元",
+                content_fingerprint="99元",
+            ),
+        ),
+    )
+    adapter.summaries = []
+    clock.advance(30 * 60)
+    worker.run_once()
+    assert adapter.sent == ["99元", "刚才的价格还有疑问吗？"]
+    assert repository.sales_states["c1"].follow_up_count == 1
+    clock.advance(30 * 60)
+    worker.run_once()
+    assert len(adapter.sent) == 2
+
+
+def test_price_silence_follow_up_uses_saved_price_reply_and_is_off_by_default() -> None:
+    for enabled in (False, True):
+        clock = FakeClock()
+        repository = FirstContactRepository()
+        repository.settings[FIRST_CONTACT_MESSAGE_SETTING] = "已保存的型号价格话术"
+        if enabled:
+            repository.settings[PRICE_SILENCE_FOLLOW_UP_SETTING] = "需要再帮您确认型号吗？"
+        adapter = FakeAdapter({"c1": _dialog_snapshot(
+            "c1",
+            (MessageDirection.OUTGOING, "有的"),
+            (MessageDirection.INCOMING, "实价吗"),
+        )})
+        worker = CustomerServiceWorker(
+            adapter,
+            repository,
+            FakeModel("对 实价"),
+            config=CustomerServiceConfig(
+                mode=ReceptionMode.AUTO_SEND,
+                checkout_guidance_enabled=True,
+            ),
+            clock=clock,
+        )
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+
+        assert adapter.sent == ["已保存的型号价格话术"]
+        assert ("c1" in repository.sales_states) is enabled
+
+
+def test_price_silence_message_is_cancelled_after_order_or_setting_cleared() -> None:
+    for ordered in (False, True):
+        clock = FakeClock()
+        clock.wall = datetime(2026, 1, 1, 10, 0, tzinfo=UTC)
+        repository = FirstContactRepository()
+        repository.settings[PRICE_SILENCE_FOLLOW_UP_SETTING] = "还需要我帮您确认吗？"
+        adapter = FakeAdapter({"c1": _dialog_snapshot(
+            "c1",
+            (MessageDirection.OUTGOING, "有的"),
+            (MessageDirection.INCOMING, "6030多少钱"),
+        )})
+        worker = CustomerServiceWorker(
+            adapter,
+            repository,
+            FakeModel("99元"),
+            config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+            clock=clock,
+        )
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+        assert repository.sales_states["c1"].status == "pending"
+
+        if ordered:
+            adapter.snapshots["c1"] = ConversationSnapshot(
+                "c1",
+                (
+                    ChatMessage("m1", MessageDirection.INCOMING, MessageKind.TEXT, "6030多少钱"),
+                    ChatMessage("m2", MessageDirection.INCOMING, MessageKind.TEXT, "已拍下"),
+                    ChatMessage(
+                        "m3", MessageDirection.OUTGOING, MessageKind.TEXT, "99元",
+                        content_fingerprint="99元",
+                    ),
+                ),
+            )
+        else:
+            repository.settings.pop(PRICE_SILENCE_FOLLOW_UP_SETTING)
+            adapter.snapshots["c1"] = ConversationSnapshot(
+                "c1",
+                (
+                    ChatMessage("m1", MessageDirection.INCOMING, MessageKind.TEXT, "6030多少钱"),
+                    ChatMessage(
+                        "m2", MessageDirection.OUTGOING, MessageKind.TEXT, "99元",
+                        content_fingerprint="99元",
+                    ),
+                ),
+            )
+        adapter.summaries = []
+        clock.advance(30 * 60)
+        worker.run_once()
+        assert adapter.sent == ["99元"]
+        assert repository.sales_states["c1"].status == "cancelled"
 
 
 def test_first_observation_keeps_the_complete_customer_turn() -> None:
@@ -2259,6 +2766,85 @@ def test_repeated_send_failures_halt_auto_reception() -> None:
 
     assert worker.status is ReceptionStatus.HALTED
     assert len(
-        [draft for draft in worker.drafts.list() if draft.status is ReplyJobStatus.FAILED]
+        [draft for draft in worker.drafts.list() if draft.status is ReplyJobStatus.HANDOFF]
     ) == 3
     assert repository.processed == set()
+
+
+def test_unconfirmed_send_is_handed_off_and_never_retried() -> None:
+    clock = FakeClock()
+    adapter = UnconfirmedSendAdapter({"c1": _snapshot("c1", "6030尺寸能装吗")})
+    repository = FakeRepository()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("先量下电池仓"),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+    assert adapter.sent == ["先量下电池仓"]
+    assert worker.drafts.list()[-1].status is ReplyJobStatus.HANDOFF
+    assert repository.has_open_handoff("c1")
+
+    for _ in range(5):
+        clock.advance(10)
+        worker.run_once()
+    assert adapter.sent == ["先量下电池仓"]
+
+
+def test_hundred_conversation_burst_drains_without_starvation() -> None:
+    clock = FakeClock()
+    snapshots = {
+        f"c{index}": _snapshot(f"c{index}", "6030能装吗")
+        for index in range(100)
+    }
+    adapter = FakeAdapter(snapshots)
+    repository = FakeRepository()
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("先量下电池仓"),
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    for _ in range(15):
+        worker.run_once()
+        clock.advance(7)
+
+    assert len(adapter.sent) == 100
+    assert len(repository.processed) == 100
+    assert worker.status is ReceptionStatus.RUNNING
+    assert worker.progress.poll_count == 15
+
+
+def test_poll_heartbeat_records_slow_model_and_skip_reason() -> None:
+    clock = FakeClock()
+
+    class SlowModel(FakeModel):
+        def complete_text(self, *, system_prompt: str, user_prompt: str, model: str) -> ModelResponse:
+            clock.advance(20)
+            return super().complete_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=model,
+            )
+
+    adapter = FakeAdapter({"c1": _snapshot("c1", "6030能装吗")})
+    worker = _worker(adapter, clock, FakeRepository(), SlowModel("先量下电池仓"))
+    worker.start()
+    worker.run_once()
+    clock.advance(7)
+    worker.run_once()
+
+    assert worker.progress.last_poll_ms == 20_000
+    assert worker.progress.last_healthy_at is not None
+    assert worker.progress.phase == "idle"
+    worker.run_once()
+    assert dict(worker.progress.skip_counts)["existing_job"] == 1

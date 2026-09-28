@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
@@ -23,7 +24,12 @@ class ChatAdapterDiagnostics:
     """Write bounded, local diagnostics without logging chat content."""
 
     def __init__(self, root: Path | None = None) -> None:
-        self._root = root or Path.cwd() / "debug" / "customer_service"
+        self._root = root or (
+            Path(os.environ.get("LOCALAPPDATA", str(Path.cwd())))
+            / "XianyuAssistant"
+            / "diagnostics"
+            / "customer_service"
+        )
 
     def record_failure(self, page: DiagnosticPage | None, reason: str) -> None:
         """Save redacted DOM text and a screenshot when the page is available."""

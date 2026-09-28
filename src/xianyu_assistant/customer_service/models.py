@@ -66,6 +66,7 @@ class SalesStage(StrEnum):
     PROVE_VALUE = "prove_value"
     CLOSE = "close"
     FOLLOWED_UP = "followed_up"
+    PRICE_FOLLOW_UP = "price_follow_up"
     PAUSED = "paused"
 
 
@@ -168,6 +169,7 @@ class CustomerServiceConfig:
     sales_follow_up_delay_minutes: int = 30
     sales_follow_up_start_hour: int = 9
     sales_follow_up_end_hour: int = 22
+    checkout_guidance_enabled: bool = False
 
     def __post_init__(self) -> None:
         """Normalize enum-like input and reject unsafe runtime parameters."""
@@ -277,6 +279,7 @@ class ConversationSnapshot:
     product_title: str | None = None
     product_url: str | None = None
     system_events: tuple[PlatformSystemEvent, ...] = ()
+    displayed_listing_price: str | None = None
 
     def __post_init__(self) -> None:
         if not self.conversation_key.strip():

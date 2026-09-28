@@ -8,6 +8,25 @@ from contextlib import closing
 from pathlib import Path
 
 _FORBIDDEN_COLUMN_FRAGMENTS = ("api_key", "password", "secret", "access_token")
+_RUNTIME_CUSTOMER_TABLES = (
+    "cs_conversations",
+    "cs_messages",
+    "cs_reply_jobs",
+    "cs_handoff_events",
+    "cs_price_change_tasks",
+    "cs_run_sessions",
+    "cs_processed_fingerprints",
+    "cs_negotiation_states",
+    "cs_sales_states",
+    "cs_conversation_states",
+    "cs_conversation_fulfillment",
+    "cs_customer_turns",
+    "cs_send_outbox",
+    "cs_first_contact_catalog",
+    "cs_customers",
+    "cs_customer_conversations",
+    "cs_customer_state_events",
+)
 
 
 def stage_database(source: Path, destination: Path) -> None:
@@ -24,6 +43,20 @@ def stage_database(source: Path, destination: Path) -> None:
         sqlite3.connect(destination) as destination_connection,
     ):
         source_connection.backup(destination_connection)
+
+    # Installers seed product knowledge and merchant settings, never a copy of
+    # the source computer's live customers or reply/send audit state.
+    with sqlite3.connect(destination) as connection:
+        existing_tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for table_name in _RUNTIME_CUSTOMER_TABLES:
+            if table_name in existing_tables:
+                connection.execute(f'DELETE FROM "{table_name}"')
+    # DELETE leaves removed records in SQLite free pages; rebuild the copy.
+    with sqlite3.connect(destination) as connection:
+        connection.execute("VACUUM")
 
     with sqlite3.connect(f"file:{destination.as_posix()}?mode=ro", uri=True) as connection:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()

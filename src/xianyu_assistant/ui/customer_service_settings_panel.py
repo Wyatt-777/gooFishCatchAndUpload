@@ -37,6 +37,8 @@ from xianyu_assistant.customer_service.current_catalog import (
     FIRST_CONTACT_CATALOG_REPLY,
     FIRST_CONTACT_MESSAGE_SETTING,
     MAX_FIRST_CONTACT_MESSAGE_LENGTH,
+    MAX_PRICE_SILENCE_FOLLOW_UP_LENGTH,
+    PRICE_SILENCE_FOLLOW_UP_SETTING,
     install_current_catalog,
 )
 from xianyu_assistant.customer_service.deepseek_client import (
@@ -180,6 +182,33 @@ class CustomerServiceSettingsPanel(QWidget):
         first_contact_layout.addWidget(self.first_contact_message_input)
         first_contact_layout.addLayout(first_contact_buttons)
 
+        self.price_silence_follow_up_input = QPlainTextEdit()
+        self.price_silence_follow_up_input.setPlainText(
+            repository.get_setting(PRICE_SILENCE_FOLLOW_UP_SETTING, "") or ""
+        )
+        self.price_silence_follow_up_input.setPlaceholderText(
+            "例如：刚才咨询的电池还需要了解什么吗？需要的话我可以继续帮您确认。"
+        )
+        self.price_silence_follow_up_input.setMinimumHeight(110)
+        self.save_price_silence_follow_up_button = QPushButton("保存未下单追问话术")
+        self.save_price_silence_follow_up_button.setObjectName("primaryAction")
+        self.clear_price_silence_follow_up_button = QPushButton("停用并清空话术")
+        price_follow_up_buttons = QHBoxLayout()
+        price_follow_up_buttons.addWidget(self.save_price_silence_follow_up_button)
+        price_follow_up_buttons.addWidget(self.clear_price_silence_follow_up_button)
+        price_follow_up_buttons.addStretch()
+        price_follow_up_group = QGroupBox("问价后未下单固定追问")
+        price_follow_up_layout = QVBoxLayout(price_follow_up_group)
+        price_follow_up_hint = QLabel(
+            "仅全自动客服使用。顾客问价、客服回复后，如果顾客没有再发消息且没有已知下单记录，"
+            "默认 30 分钟后在 09:00–22:00 发送一次。留空时停用；发送前会再次检查会话。"
+        )
+        price_follow_up_hint.setWordWrap(True)
+        price_follow_up_hint.setObjectName("mutedText")
+        price_follow_up_layout.addWidget(price_follow_up_hint)
+        price_follow_up_layout.addWidget(self.price_silence_follow_up_input)
+        price_follow_up_layout.addLayout(price_follow_up_buttons)
+
         self.product_table = QTableWidget(0, 6)
         self.product_table.setHorizontalHeaderLabels(("商品 Key", "名称", "平台 ID", "标价", "最低价", "状态"))
         self._configure_table(self.product_table)
@@ -280,6 +309,7 @@ class CustomerServiceSettingsPanel(QWidget):
         layout.addWidget(subtitle)
         layout.addWidget(api_group)
         layout.addWidget(first_contact_group)
+        layout.addWidget(price_follow_up_group)
         layout.addWidget(product_group)
         layout.addWidget(media_group)
         layout.addWidget(import_group)
@@ -294,6 +324,12 @@ class CustomerServiceSettingsPanel(QWidget):
         )
         self.reset_first_contact_message_button.clicked.connect(
             self.reset_first_contact_message
+        )
+        self.save_price_silence_follow_up_button.clicked.connect(
+            self.save_price_silence_follow_up
+        )
+        self.clear_price_silence_follow_up_button.clicked.connect(
+            self.clear_price_silence_follow_up
         )
         self.add_product_button.clicked.connect(self.add_product)
         self.sync_chat_button.clicked.connect(self.sync_live_chats)
@@ -368,6 +404,28 @@ class CustomerServiceSettingsPanel(QWidget):
         self.repository.delete_setting(FIRST_CONTACT_MESSAGE_SETTING)
         self.first_contact_message_input.setPlainText(FIRST_CONTACT_CATALOG_REPLY)
         self._set_status("首轮话术已恢复为默认内容。")
+
+    def save_price_silence_follow_up(self) -> None:
+        """Enable the one-time price inquiry follow-up with edited text."""
+        message = self.price_silence_follow_up_input.toPlainText().strip()
+        if not message:
+            self._set_status("未下单追问话术不能为空；如需停用请点击“停用并清空话术”。", error=True)
+            return
+        if len(message) > MAX_PRICE_SILENCE_FOLLOW_UP_LENGTH:
+            self._set_status(
+                f"未下单追问话术不能超过 {MAX_PRICE_SILENCE_FOLLOW_UP_LENGTH} 个字符。",
+                error=True,
+            )
+            return
+        self.repository.set_setting(PRICE_SILENCE_FOLLOW_UP_SETTING, message)
+        self.price_silence_follow_up_input.setPlainText(message)
+        self._set_status("未下单追问话术已保存，将用于符合条件的问价会话。")
+
+    def clear_price_silence_follow_up(self) -> None:
+        """Disable pending and future price follow-ups without changing other sales nudges."""
+        self.repository.delete_setting(PRICE_SILENCE_FOLLOW_UP_SETTING)
+        self.price_silence_follow_up_input.clear()
+        self._set_status("未下单追问话术已停用。")
 
     def add_product(self) -> None:
         dialog = ProductKnowledgeDialog(parent=self)

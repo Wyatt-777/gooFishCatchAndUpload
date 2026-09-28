@@ -24,7 +24,7 @@ _MONEY_UNIT_RE = re.compile(
     r"(?:[¥￥]\s*(?P<prefix>\d+(?:\.\d+)?)|(?P<suffix>\d+(?:\.\d+)?)\s*(?:元|块钱|块))",
     re.IGNORECASE,
 )
-_COMPACT_BATTERY_RE = re.compile(r"(?<!\d)((?:48|60)\d{2})(?!\d)")
+_COMPACT_BATTERY_RE = re.compile(r"(?<!\d)((?:48|60)\d{2}|(?:48|60)\s+(?:20|30))(?!\d)")
 _PURE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:元|块)?\s*[？?。!！]*\s*$")
 _QUANTITY_RE = re.compile(r"(?<!\d)(\d+)\s*(?:组|套|只|个)(?!人)")
 
@@ -131,7 +131,7 @@ def analyze_customer_turn(
 
     battery_model: str | None = None
     if compact_models:
-        raw = compact_models[-1].group(1)
+        raw = re.sub(r"\s+", "", compact_models[-1].group(1))
         battery_model = f"{raw[:2]}V{raw[2:]}Ah"
     elif voltages and capacities:
         battery_model = (

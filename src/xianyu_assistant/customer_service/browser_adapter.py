@@ -8,6 +8,7 @@ future page changes stay isolated from orchestration and policy code.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -618,14 +619,14 @@ class PlaywrightXianyuChatAdapter:
                     platform_time=_parse_datetime(item.get_attribute(selectors.platform_time_attribute)),
                 )
             )
-        product_id, product_title = self._read_product_card(page)
-        if not product_id or not product_title:
-            info = self._selected_session_info or self._session_info_from_page(page)
-            if info:
-                item_info = info.get("item_info")
-                if isinstance(item_info, dict):
-                    product_id = product_id or _string(item_info.get("item_id"))
-                    product_title = product_title or _string(item_info.get("title"))
+        product_id, product_title, displayed_price = self._read_product_card(page)
+        info = self._selected_session_info or self._session_info_from_page(page)
+        if info:
+            item_info = info.get("item_info")
+            if isinstance(item_info, dict):
+                product_id = product_id or _string(item_info.get("item_id"))
+                product_title = product_title or _string(item_info.get("title"))
+                displayed_price = displayed_price or _string(item_info.get("price"))
         conversation_key = self._current_conversation_key(page)
         system_events: list[PlatformSystemEvent] = []
         if selectors.system_message_items:
@@ -651,6 +652,7 @@ class PlaywrightXianyuChatAdapter:
             platform_product_id=product_id,
             product_title=product_title,
             system_events=tuple(system_events),
+            displayed_listing_price=displayed_price,
         )
 
     def request_voice_transcript(self, message_key: str) -> str | None:
@@ -995,13 +997,18 @@ class PlaywrightXianyuChatAdapter:
             raise ChatAdapterError(health.detail or "客服页面不健康。")
         return self._require_page()
 
-    def _read_product_card(self, page: PageLike) -> tuple[str | None, str | None]:
+    def _read_product_card(self, page: PageLike) -> tuple[str | None, str | None, str | None]:
         selector = self._contract.selectors.product_card
         if not selector:
-            return None, None
+            return None, None, None
         card = page.locator(selector)
         if card.count() != 1:
-            return None, None
+            return None, None, None
+        card_text = card.inner_text().strip()
+        displayed_match = re.search(
+            r"(?:活动价|现价|标价)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)",
+            card_text,
+        )
         title = card.get_attribute(self._contract.selectors.product_title_attribute)
         if self._contract.selectors.product_title_selector:
             title_locator = card.locator(self._contract.selectors.product_title_selector)
@@ -1014,7 +1021,11 @@ class PlaywrightXianyuChatAdapter:
                 href = link.get_attribute("href")
                 if href:
                     product_id = _query_parameter(href, "id")
-        return product_id, title or card.inner_text().strip() or None
+        return (
+            product_id,
+            title or card_text or None,
+            displayed_match.group(1) if displayed_match else None,
+        )
 
     def _current_conversation_key(self, page: PageLike) -> str:
         selectors = self._contract.selectors

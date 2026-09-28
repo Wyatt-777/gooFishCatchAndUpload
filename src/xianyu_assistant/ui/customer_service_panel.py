@@ -10,6 +10,7 @@ from datetime import datetime
 
 from PyQt6.QtCore import QSignalBlocker, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFrame,
     QGroupBox,
@@ -36,6 +37,7 @@ from xianyu_assistant.customer_service.browser_adapter import (
 from xianyu_assistant.customer_service.customer_service_worker import (
     CustomerServiceWorker,
     CustomerServiceWorkerError,
+    ReceptionProgress,
 )
 from xianyu_assistant.customer_service.deepseek_client import DeepSeekClient
 from xianyu_assistant.customer_service.models import (
@@ -69,6 +71,7 @@ class CustomerServiceRunThread(QThread):
         browser_config: BrowserConnectionConfig,
         *,
         mode: ReceptionMode = ReceptionMode.HUMAN_CONFIRMATION,
+        checkout_guidance_enabled: bool = False,
         credential_store: CredentialStore | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -76,6 +79,7 @@ class CustomerServiceRunThread(QThread):
         self._repository = repository
         self._browser_config = browser_config
         self._mode = mode
+        self._checkout_guidance_enabled = checkout_guidance_enabled
         self._credential_store = credential_store
         self._engine: CustomerServiceWorker | None = None
         self._engine_lock = threading.RLock()
@@ -103,7 +107,10 @@ class CustomerServiceRunThread(QThread):
                 adapter,
                 self._repository,
                 model,
-                config=CustomerServiceConfig(mode=self._mode),
+                config=CustomerServiceConfig(
+                    mode=self._mode,
+                    checkout_guidance_enabled=self._checkout_guidance_enabled,
+                ),
                 text_model=settings.text_model,
                 vision_model=settings.vision_model,
             )
@@ -167,6 +174,11 @@ class CustomerServiceRunThread(QThread):
         with self._engine_lock:
             engine = self._engine
         return [] if engine is None else engine.drafts.list()
+
+    def progress_snapshot(self) -> ReceptionProgress | None:
+        with self._engine_lock:
+            engine = self._engine
+        return None if engine is None else engine.progress
 
     def edit_draft(self, job_id: str, text: str) -> ReplyDraft:
         """Edit a draft through the worker's validation boundary."""
@@ -272,6 +284,11 @@ class CustomerServicePanel(QWidget):
         self.mode_combo.setToolTip(
             "默认人工审核；全自动模式会发送回复，并对通过全部规则的待付款订单直接改价。"
         )
+        self.checkout_guidance_checkbox = QCheckBox("试用下单引导")
+        self.checkout_guidance_checkbox.setChecked(False)
+        self.checkout_guidance_checkbox.setToolTip(
+            "本次运行启用克制的下单引导；默认关闭。人工模式可先审核草稿，全自动模式会直接发送。"
+        )
         self.status_label = QLabel("已停止")
         self.status_label.setObjectName("receptionStatus")
         self.status_label.setProperty("tone", "neutral")
@@ -285,10 +302,14 @@ class CustomerServicePanel(QWidget):
         self.stop_button.setEnabled(False)
         self.connection_hint = QLabel("浏览器连接：使用“浏览器设置”中的本机 CDP 端口")
         self.connection_hint.setObjectName("mutedText")
+        self.activity_label = QLabel("轮询：尚未启动")
+        self.activity_label.setObjectName("mutedText")
+        self.activity_label.setWordWrap(True)
         controls = QHBoxLayout()
         controls.setSpacing(8)
         controls.addWidget(QLabel("运行模式"))
         controls.addWidget(self.mode_combo, 1)
+        controls.addWidget(self.checkout_guidance_checkbox)
         controls.addSpacing(8)
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
@@ -299,6 +320,7 @@ class CustomerServicePanel(QWidget):
         status_row.addWidget(self.connection_hint)
         control_layout.addLayout(controls)
         control_layout.addLayout(status_row)
+        control_layout.addWidget(self.activity_label)
 
         self.price_change_group = QGroupBox("订单改价 · 审核与记录")
         price_layout = QVBoxLayout(self.price_change_group)
@@ -568,7 +590,13 @@ class CustomerServicePanel(QWidget):
                 "全自动模式会代表你直接回复顾客，并会修改符合规则的真实待付款订单价格。"
                 "请确认商品标价、最低成交价和议价规则均已核对。\n\n"
                 "改价前会重新读取会话并校验型号、最终成交价、价格区间和最新消息；"
-                "无法确认或页面操作失败时不会重试，只会将该顾客转人工，其他顾客继续处理。",
+                "无法确认或页面操作失败时不会重试，只会将该顾客转人工，其他顾客继续处理。"
+                + (
+                    "\n\n本次同时试用下单引导：有明确购买意向时可能追加一句引导，"
+                    "符合条件时可能在顾客沉默后追问一次。"
+                    if self.checkout_guidance_checkbox.isChecked()
+                    else ""
+                ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -584,6 +612,7 @@ class CustomerServicePanel(QWidget):
             self.repository,
             config,
             mode=mode,
+            checkout_guidance_enabled=self.checkout_guidance_checkbox.isChecked(),
             credential_store=self._credential_store,
             parent=self,
         )
@@ -599,8 +628,13 @@ class CustomerServicePanel(QWidget):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.mode_combo.setEnabled(False)
+        self.checkout_guidance_checkbox.setEnabled(False)
         self._set_status(
-            "正在启动全自动客服…"
+            (
+                "正在启动全自动客服（试用下单引导）…"
+                if self.checkout_guidance_checkbox.isChecked()
+                else "正在启动全自动客服…"
+            )
             if mode is ReceptionMode.AUTO_SEND
             else "正在启动客服页…"
         )
@@ -617,6 +651,7 @@ class CustomerServicePanel(QWidget):
 
     def refresh_drafts(self) -> None:
         """Refresh only the local draft table; no browser operation is performed."""
+        self._refresh_activity()
         self.refresh_handoffs()
         self.refresh_price_changes()
         if self._run_thread is None:
@@ -650,6 +685,70 @@ class CustomerServicePanel(QWidget):
             self.draft_table if drafts else self.draft_empty_state
         )
         self._update_edit_state()
+
+    def _refresh_activity(self) -> None:
+        thread = self._run_thread
+        if thread is None:
+            return
+        reader = getattr(thread, "progress_snapshot", None)
+        if not callable(reader):
+            return
+        progress = reader()
+        if progress is None:
+            self.activity_label.setText("轮询：正在启动")
+            return
+        phase_labels = {
+            "idle": "等待下一轮",
+            "polling": "轮询中",
+            "checking_page": "检查客服页",
+            "listing_conversations": "读取会话列表",
+            "reading_context": "读取会话上下文",
+            "generating_drafts": "生成回复",
+            "generating": "调用模型生成回复",
+            "policy_check": "检查回复策略",
+            "sending": "发送并确认消息",
+            "sales_follow_ups": "检查销售追问",
+            "halted": "已安全暂停",
+        }
+        phase = phase_labels.get(progress.phase, progress.phase)
+        elapsed = (
+            max(0, int((datetime.now().astimezone() - progress.phase_started_at).total_seconds()))
+            if progress.phase_started_at is not None
+            else 0
+        )
+        warning = " · 处理时间偏长，请检查日志" if progress.phase not in {"idle", "halted"} and elapsed >= 180 else ""
+        healthy_age = (
+            max(0, int((datetime.now().astimezone() - progress.last_healthy_at).total_seconds()))
+            if progress.last_healthy_at is not None
+            else None
+        )
+        skip_labels = {
+            "open_handoff": "已转人工",
+            "persisted_handoff": "已转人工",
+            "already_processed": "已处理",
+            "existing_job": "已有任务",
+            "restored_draft": "等待审核",
+            "no_new_customer_message": "无新消息",
+            "conversation_read_error": "读取失败",
+            "post_fulfillment": "已发货",
+            "unstable_conversation_id": "会话标识不稳定",
+        }
+        skip_detail = "、".join(
+            f"{skip_labels.get(reason, reason)} {count}"
+            for reason, count in progress.skip_counts[:2]
+        )
+        self.activity_label.setText(
+            f"轮询 {progress.poll_count} 次 · {phase} {elapsed} 秒 · "
+            f"上轮候选 {progress.candidate_count} / 新消息 {progress.observed_count} / "
+            f"待生成 {progress.pending_count}"
+            + (
+                f"（最久 {progress.oldest_pending_seconds} 秒）"
+                if progress.pending_count else ""
+            )
+            + (f" · 上次页面正常 {healthy_age} 秒前" if healthy_age is not None else "")
+            + (f" · 跳过：{skip_detail}" if skip_detail else "")
+            + warning
+        )
 
     def refresh_price_changes(self) -> None:
         """Refresh persisted price proposals without touching the browser."""
@@ -1065,6 +1164,7 @@ class CustomerServicePanel(QWidget):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.mode_combo.setEnabled(True)
+        self.checkout_guidance_checkbox.setEnabled(True)
         self._run_thread = None
 
     def _approval_finished(self, job_id: str, sent: bool, message: str) -> None:

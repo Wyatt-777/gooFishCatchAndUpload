@@ -24,3 +24,10 @@ def test_diagnostics_redact_dom_summary_and_keep_screenshot_local(tmp_path: Path
     assert "13800138000" not in summary
     assert "13800138000" not in json.dumps(metadata, ensure_ascii=False)
     assert (directory / "page.png").read_bytes() == b"fixture-png"
+
+
+def test_default_diagnostics_directory_uses_local_app_data(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    ChatAdapterDiagnostics().record_failure(FakeDiagnosticPage(), "页面结构变化")
+
+    assert list((tmp_path / "XianyuAssistant" / "diagnostics" / "customer_service").glob("*/metadata.json"))

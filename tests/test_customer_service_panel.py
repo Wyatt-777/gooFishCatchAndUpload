@@ -108,6 +108,7 @@ class FakeStartThread:
 
     def __init__(self, *_args: object, mode: ReceptionMode, **_kwargs: object) -> None:
         self.mode = mode
+        self.checkout_guidance_enabled = _kwargs.get("checkout_guidance_enabled", False)
         self.started = False
         self.status_changed = FakeSignal()
         self.drafts_changed = FakeSignal()
@@ -163,6 +164,8 @@ def test_auto_send_cancel_keeps_reception_stopped(
     repository.initialize()
     panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig(port=9333))
     panel.mode_combo.setCurrentIndex(1)
+    assert panel.checkout_guidance_checkbox.isChecked() is False
+    panel.checkout_guidance_checkbox.setChecked(True)
     monkeypatch.setattr(  # type: ignore[attr-defined]
         panel_module.QMessageBox,
         "warning",
@@ -186,6 +189,7 @@ def test_auto_send_confirm_starts_thread_and_locks_mode(
     repository.initialize()
     panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig(port=9333))
     panel.mode_combo.setCurrentIndex(1)
+    panel.checkout_guidance_checkbox.setChecked(True)
     monkeypatch.setattr(panel_module, "CustomerServiceRunThread", FakeStartThread)
     monkeypatch.setattr(  # type: ignore[attr-defined]
         panel_module.QMessageBox,
@@ -197,8 +201,10 @@ def test_auto_send_confirm_starts_thread_and_locks_mode(
 
     assert len(FakeStartThread.instances) == 1
     assert FakeStartThread.instances[0].mode is ReceptionMode.AUTO_SEND
+    assert FakeStartThread.instances[0].checkout_guidance_enabled is True
     assert FakeStartThread.instances[0].started is True
     assert panel.mode_combo.isEnabled() is False
+    assert panel.checkout_guidance_checkbox.isEnabled() is False
     assert "全自动客服" in panel.status_label.text()
     panel._refresh_timer.stop()
 

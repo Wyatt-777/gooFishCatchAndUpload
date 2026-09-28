@@ -81,6 +81,10 @@ def test_send_not_performed_can_return_to_manual_review() -> None:
     assert state is ReplyJobStatus.AWAITING_REVIEW
 
 
+def test_uncertain_send_can_be_handed_off_without_retry() -> None:
+    assert transition_reply(ReplyJobStatus.SENDING, ReplyJobStatus.HANDOFF) is ReplyJobStatus.HANDOFF
+
+
 @pytest.mark.parametrize(
     ("current", "target"),
     [

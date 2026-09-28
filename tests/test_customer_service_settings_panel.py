@@ -5,6 +5,7 @@ from pathlib import Path
 from xianyu_assistant.customer_service.current_catalog import (
     FIRST_CONTACT_CATALOG_REPLY,
     FIRST_CONTACT_MESSAGE_SETTING,
+    PRICE_SILENCE_FOLLOW_UP_SETTING,
 )
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 from xianyu_assistant.security.credential_store import MemoryCredentialStore
@@ -21,6 +22,7 @@ def test_settings_panel_loads_defaults_without_network_or_keyring(
     assert panel.base_url_input.text() == "https://api.deepseek.com"
     assert panel.text_model_input.text() == "deepseek-chat"
     assert panel.first_contact_message_input.toPlainText() == FIRST_CONTACT_CATALOG_REPLY
+    assert panel.price_silence_follow_up_input.toPlainText() == ""
     assert panel.product_table.rowCount() == 0
     assert panel.media_table.rowCount() == 0
     assert panel.import_button.isEnabled() is False
@@ -67,3 +69,21 @@ def test_settings_panel_rejects_an_empty_first_contact_message(
 
     assert repository.get_setting(FIRST_CONTACT_MESSAGE_SETTING) is None
     assert "不能为空" in panel.config_status_label.text()
+
+
+def test_settings_panel_saves_and_disables_price_silence_follow_up(
+    qapp: object, tmp_path: Path
+) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    panel = CustomerServiceSettingsPanel(repository, credential_store=MemoryCredentialStore())
+    panel.price_silence_follow_up_input.setPlainText("刚才的价格还有疑问吗？")
+    panel.save_price_silence_follow_up()
+
+    assert repository.get_setting(PRICE_SILENCE_FOLLOW_UP_SETTING) == "刚才的价格还有疑问吗？"
+    reloaded = CustomerServiceSettingsPanel(repository, credential_store=MemoryCredentialStore())
+    assert reloaded.price_silence_follow_up_input.toPlainText() == "刚才的价格还有疑问吗？"
+
+    reloaded.clear_price_silence_follow_up()
+    assert repository.get_setting(PRICE_SILENCE_FOLLOW_UP_SETTING) is None
+    assert reloaded.price_silence_follow_up_input.toPlainText() == ""

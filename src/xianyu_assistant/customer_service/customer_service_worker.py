@@ -12,7 +12,7 @@ import logging
 import queue
 import re
 import threading
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, replace
@@ -26,7 +26,9 @@ from xianyu_assistant.customer_service.current_catalog import (
     FIRST_CONTACT_CATALOG_REPLY,
     FIRST_CONTACT_MESSAGE_SETTING,
     MAX_FIRST_CONTACT_MESSAGE_LENGTH,
+    MAX_PRICE_SILENCE_FOLLOW_UP_LENGTH,
     NEGOTIATION_OPENING_COUNTERS,
+    PRICE_SILENCE_FOLLOW_UP_SETTING,
 )
 from xianyu_assistant.customer_service.fingerprints import (
     batch_fingerprint,
@@ -83,7 +85,10 @@ from xianyu_assistant.customer_service.protocols import (
     TextSendNotPerformedError,
     XianyuChatAdapter,
 )
-from xianyu_assistant.customer_service.sales import build_sales_plan
+from xianyu_assistant.customer_service.sales import (
+    build_checkout_guidance_plan,
+    build_sales_plan,
+)
 from xianyu_assistant.customer_service.seller_style_profile import (
     SELLER_DIALOGUE_PLAYBOOK,
     SELLER_STYLE_CONSTRAINTS,
@@ -145,13 +150,15 @@ _BATTERY_CAPACITY_RE = re.compile(
     r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:ah|安时|安)(?![a-z\d])",
     re.IGNORECASE,
 )
-_BATTERY_SIZE_MODEL_RE = re.compile(r"(?<!\d)(?:6030|6020|4830)(?!\d)")
+_BATTERY_SIZE_MODEL_RE = re.compile(r"(?<!\d)(?:6030|6020|4830|60\s+30|60\s+20|48\s+30)(?!\d)")
 _BATTERY_SIZE_TO_CANONICAL_MODEL = {
     "6020": "60V20Ah",
     "6030": "60V30Ah",
     "4830": "48V30Ah",
 }
 _PRICE_INQUIRY_MARKERS = (
+    "实价",
+    "标价",
     "多少钱",
     "多钱",
     "什么价",
@@ -255,6 +262,23 @@ class PriceChangeResult:
     applied: bool
     reason: str | None = None
     receipt: PriceChangeReceipt | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReceptionProgress:
+    """Small, content-free heartbeat readable from the UI thread."""
+
+    phase: str = "idle"
+    phase_started_at: datetime | None = None
+    last_poll_completed_at: datetime | None = None
+    last_healthy_at: datetime | None = None
+    poll_count: int = 0
+    candidate_count: int = 0
+    observed_count: int = 0
+    pending_count: int = 0
+    oldest_pending_seconds: int = 0
+    last_poll_ms: int = 0
+    skip_counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +399,9 @@ class CustomerServiceWorker:
         self._consecutive_model_failures = 0
         self._consecutive_send_failures = 0
         self._consecutive_page_health_failures = 0
+        self._progress = ReceptionProgress()
+        self._poll_skips: Counter[str] = Counter()
+        self._phase_started_monotonic = self._clock.monotonic()
 
     @property
     def status(self) -> ReceptionStatus:
@@ -393,6 +420,33 @@ class CustomerServiceWorker:
     def stop_reason(self) -> str | None:
         """Return the redacted reason for the latest global stop or halt."""
         return self._stop_reason
+
+    @property
+    def progress(self) -> ReceptionProgress:
+        with self._lock:
+            return self._progress
+
+    def _set_phase(self, phase: str) -> None:
+        now_monotonic = self._clock.monotonic()
+        with self._lock:
+            previous = self._progress.phase
+            elapsed_ms = max(0, int((now_monotonic - self._phase_started_monotonic) * 1000))
+            self._progress = replace(
+                self._progress,
+                phase=phase,
+                phase_started_at=self._clock.now(),
+            )
+            self._phase_started_monotonic = now_monotonic
+        if previous != phase:
+            logger.info(
+                "CS_TRACE %s",
+                json.dumps(
+                    {"event": "phase_change", "from": previous, "to": phase, "duration_ms": elapsed_ms}
+                ),
+            )
+
+    def _skip(self, reason: str) -> None:
+        self._poll_skips[reason] += 1
 
     def start(self) -> ReceptionStatus:
         """Create the app-owned page and enter RUNNING only if it is healthy."""
@@ -458,6 +512,65 @@ class CustomerServiceWorker:
         """Poll at most the configured number of conversations and generate due drafts."""
         if self.status is not ReceptionStatus.RUNNING or self._stop_event.is_set():
             return 0
+        started = self._clock.monotonic()
+        self._poll_skips.clear()
+        with self._lock:
+            self._progress = replace(
+                self._progress,
+                poll_count=self._progress.poll_count + 1,
+                candidate_count=0,
+                observed_count=0,
+            )
+        self._set_phase("polling")
+        try:
+            return self._poll_once()
+        except Exception as error:
+            logger.exception("客服轮询异常。")
+            logger.info("CS_TRACE %s", json.dumps({"event": "poll_exception", "type": type(error).__name__}))
+            raise
+        finally:
+            elapsed_ms = max(0, int((self._clock.monotonic() - started) * 1000))
+            self._set_phase("halted" if self.status is ReceptionStatus.HALTED else "idle")
+            with self._lock:
+                pending_jobs = [
+                    job for job in self._jobs.values()
+                    if job.status is ReplyJobStatus.DEBOUNCING
+                ]
+                self._progress = replace(
+                    self._progress,
+                    last_poll_completed_at=self._clock.now(),
+                    pending_count=len(pending_jobs),
+                    oldest_pending_seconds=max(
+                        (
+                            max(0, int(self._clock.monotonic() - job.debounce_due + self._config.debounce_seconds))
+                            for job in pending_jobs
+                        ),
+                        default=0,
+                    ),
+                    last_poll_ms=elapsed_ms,
+                    skip_counts=tuple(sorted(self._poll_skips.items())),
+                )
+                progress = self._progress
+            logger.info(
+                "CS_TRACE %s",
+                json.dumps(
+                    {
+                        "event": "poll_complete",
+                        "poll": progress.poll_count,
+                        "status": self.status.value,
+                        "duration_ms": elapsed_ms,
+                        "candidates": progress.candidate_count,
+                        "observed": progress.observed_count,
+                        "pending": progress.pending_count,
+                        "oldest_pending_seconds": progress.oldest_pending_seconds,
+                        "skips": dict(progress.skip_counts),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+
+    def _poll_once(self) -> int:
+        self._set_phase("checking_page")
         self._drain_commands()
         if self._stop_event.is_set():
             return 0
@@ -482,6 +595,7 @@ class CustomerServiceWorker:
                 )
             return 0
         try:
+            self._set_phase("listing_conversations")
             summaries = self._adapter.list_changed_conversations(
                 self._config.max_conversations_per_poll
             )
@@ -491,6 +605,12 @@ class CustomerServiceWorker:
                 self._halt("连续读取会话列表失败，已安全暂停。")
             return 0
         self._consecutive_page_health_failures = 0
+        with self._lock:
+            self._progress = replace(
+                self._progress,
+                last_healthy_at=self._clock.now(),
+                candidate_count=len(summaries),
+            )
         selected = self._select_fair_batch(summaries)
         observed = 0
         for summary in selected:
@@ -498,8 +618,12 @@ class CustomerServiceWorker:
                 break
             if self._observe_conversation(summary):
                 observed += 1
+        with self._lock:
+            self._progress = replace(self._progress, observed_count=observed)
+        self._set_phase("generating_drafts")
         self._process_due_jobs()
         if self._config.mode is ReceptionMode.AUTO_SEND:
+            self._set_phase("sales_follow_ups")
             self._process_due_sales_follow_ups()
         return observed
 
@@ -614,6 +738,7 @@ class CustomerServiceWorker:
             self._config.mode is ReceptionMode.AUTO_SEND
             and summary.conversation_key.startswith("dom-")
         ):
+            self._skip("unstable_conversation_id")
             self._repository.save_handoff_event(
                 conversation_key=summary.conversation_key,
                 reason="会话缺少稳定平台ID，已禁止自动回复。",
@@ -637,11 +762,13 @@ class CustomerServiceWorker:
             except Exception:  # noqa: BLE001 - CRM audit must not stop reception
                 logger.warning("顾客档案摘要保存失败。")
         if self._repository.has_open_handoff(summary.conversation_key):
+            self._skip("open_handoff")
             return False
         try:
             self._adapter.open_conversation(summary.conversation_key)
             snapshot = self._adapter.read_conversation()
         except Exception:  # noqa: BLE001 - browser errors must not stop fair scheduling
+            self._skip("conversation_read_error")
             return False
         try:
             return self._register_snapshot(snapshot)
@@ -655,11 +782,14 @@ class CustomerServiceWorker:
 
     def _register_snapshot(self, snapshot: ConversationSnapshot) -> bool:
         if self._repository.has_open_handoff(snapshot.conversation_key):
+            self._skip("open_handoff")
             return False
         if self._intercept_post_fulfillment(snapshot):
+            self._skip("post_fulfillment")
             return False
         incoming = _incoming_tail(snapshot)
         if not incoming or not snapshot.last_message_from_customer:
+            self._skip("no_new_customer_message")
             return False
         self._repository.cancel_sales_follow_up(
             snapshot.conversation_key,
@@ -670,12 +800,14 @@ class CustomerServiceWorker:
             ((message.message_key, _message_text(message)) for message in incoming),
         )
         if self._repository.has_processed_fingerprint(fingerprint):
+            self._skip("already_processed")
             return False
         previous_snapshot: ConversationSnapshot | None = None
         existing_job_id = self._job_by_conversation.get(snapshot.conversation_key)
         if existing_job_id:
             existing = self._jobs[existing_job_id]
             if existing.batch_fingerprint == fingerprint:
+                self._skip("existing_job")
                 return False
             previous_snapshot = existing.snapshot
             self._supersede(existing)
@@ -722,6 +854,7 @@ class CustomerServiceWorker:
             batch_fingerprint=fingerprint,
         )
         if persisted is not None and persisted.status is ReplyJobStatus.HANDOFF:
+            self._skip("persisted_handoff")
             return False
         if persisted is not None and persisted.status not in {
             ReplyJobStatus.FAILED,
@@ -746,6 +879,7 @@ class CustomerServiceWorker:
             self._jobs[resumed.job_id] = resumed
             self._job_by_conversation[resumed.conversation_key] = resumed.job_id
             self._queue.put(persisted)
+            self._skip("restored_draft")
             return False
         job = _PendingJob(
             job_id=f"cs-{uuid4().hex}",
@@ -784,6 +918,7 @@ class CustomerServiceWorker:
                 )
 
     def _generate_draft(self, job: _PendingJob) -> None:
+        self._set_phase("reading_context")
         try:
             self._adapter.open_conversation(job.conversation_key)
             current_snapshot = self._adapter.read_conversation()
@@ -845,9 +980,20 @@ class CustomerServiceWorker:
                 )
         if previous_price_variant != price_variant:
             previous_negotiation = None
-        semantics = self._resolve_semantics(
+        listing_teaser_reply = _listing_teaser_reply(
             context.query,
-            negotiation_active=previous_negotiation is not None,
+            context.resolved_query,
+            knowledge=base_knowledge,
+            displayed_price=job.snapshot.displayed_listing_price,
+            messages=job.snapshot.messages,
+        )
+        semantics = (
+            analyze_customer_turn(context.query)
+            if listing_teaser_reply is not None
+            else self._resolve_semantics(
+                context.query,
+                negotiation_active=previous_negotiation is not None,
+            )
         )
         context = replace(context, semantics=semantics)
         opening_counter = (
@@ -857,13 +1003,17 @@ class CustomerServiceWorker:
         )
         if bluetooth_selected and opening_counter is not None:
             opening_counter = _add_price_adjustment(opening_counter)
-        negotiation_plan = build_negotiation_plan(
-            context.query,
-            knowledge,
-            quantity=quantity,
-            opening_counter=opening_counter,
-            previous=previous_negotiation,
-            semantics=semantics,
+        negotiation_plan = (
+            None
+            if listing_teaser_reply is not None
+            else build_negotiation_plan(
+                context.query,
+                knowledge,
+                quantity=quantity,
+                opening_counter=opening_counter,
+                previous=previous_negotiation,
+                semantics=semantics,
+            )
         )
         recent_merchant_replies = tuple(
             _message_text(message)
@@ -875,6 +1025,18 @@ class CustomerServiceWorker:
         # Safety/handoff rules always win.  Negotiation must then win over generic
         # catalogue or shipping keyword replies (for example "450包邮行不行").
         proposal = _catalog_or_handoff_reply(context.query, allow_catalog=False)
+        if proposal is None:
+            proposal = listing_teaser_reply
+        if (
+            proposal is None
+            and semantics.money_offer is None
+            and _asks_unspecified_price(context.query, context.resolved_query)
+        ):
+            proposal = ReplyProposal(
+                reply_text=job.first_contact_message
+                or _configured_first_contact_message(self._repository),
+                intent="battery_catalog",
+            )
         if (
             proposal is None
             and semantics.needs_model_resolution is False
@@ -1008,8 +1170,20 @@ class CustomerServiceWorker:
                 negotiation_plan.next_state,
                 price_variant=price_variant,
             )
-        sales_plan = (
-            build_sales_plan(
+        if self._config.checkout_guidance_enabled:
+            selection = _battery_selection(context.resolved_query)
+            sales_plan = build_checkout_guidance_plan(
+                context.query,
+                proposal,
+                base_knowledge,
+                job.snapshot.messages,
+                negotiation_active=negotiation_plan is not None,
+                recent_merchant_replies=recent_merchant_replies,
+                selected_model=selection[1] if selection is not None else None,
+                quantity=quantity,
+            )
+        elif self._config.mode is ReceptionMode.AUTO_SEND:
+            sales_plan = build_sales_plan(
                 context.query,
                 proposal,
                 base_knowledge,
@@ -1017,9 +1191,8 @@ class CustomerServiceWorker:
                 negotiation_active=negotiation_plan is not None,
                 recent_merchant_replies=recent_merchant_replies,
             )
-            if self._config.mode is ReceptionMode.AUTO_SEND
-            else None
-        )
+        else:
+            sales_plan = None
         if sales_plan is None:
             sales_stage = SalesStage.PAUSED
             sales_follow_up_text = None
@@ -1027,6 +1200,16 @@ class CustomerServiceWorker:
             proposal = sales_plan.proposal
             sales_stage = sales_plan.stage
             sales_follow_up_text = sales_plan.follow_up_text
+        price_follow_up = _configured_price_silence_follow_up(self._repository)
+        if (
+            self._config.mode is ReceptionMode.AUTO_SEND
+            and price_follow_up
+            and _eligible_for_price_silence_follow_up(
+                context.query, proposal, context.semantics, negotiation_plan
+            )
+        ):
+            sales_stage = SalesStage.PRICE_FOLLOW_UP
+            sales_follow_up_text = price_follow_up
         if job.first_contact_catalog:
             proposal = replace(
                 proposal,
@@ -1035,6 +1218,15 @@ class CustomerServiceWorker:
                     job.first_contact_message,
                 ),
             )
+        if _contains_vehicle_nudge(proposal.reply_text):
+            cleaned = "\n".join(
+                line for line in proposal.reply_text.splitlines()
+                if not _contains_vehicle_nudge(line)
+            ).strip()
+            if not cleaned:
+                self._handoff(job, "回复只包含未经请求的轮型追问，已转人工核对。")
+                return
+            proposal = replace(proposal, reply_text=cleaned)
         job = replace(
             job,
             sales_stage=sales_stage,
@@ -1617,9 +1809,9 @@ class CustomerServiceWorker:
         try:
             receipt = self._adapter.send_text(send_text)
             if not self._adapter.verify_outgoing(receipt):
-                self._fail(sending, "发送后回读未确认消息。")
+                self._handoff(sending, "发送按钮已点击，但回读未确认结果；请人工核对，禁止自动重发。")
                 self._record_send_failure()
-                return ApprovalResult(job.job_id, ReplyJobStatus.FAILED, False, "发送后回读未确认。")
+                return ApprovalResult(job.job_id, ReplyJobStatus.HANDOFF, False, "发送结果未确认，已转人工核对。")
         except TextSendNotPerformedError as error:
             if first_contact_reserved:
                 release_first_contact = getattr(
@@ -1646,10 +1838,10 @@ class CustomerServiceWorker:
                 False,
                 str(error),
             )
-        except Exception:  # noqa: BLE001 - send path fails closed and records FAILED
-            self._fail(sending, "发送文本失败。")
+        except Exception:  # noqa: BLE001 - click may have succeeded before the exception
+            self._handoff(sending, "发送操作结果无法确认；请人工核对，禁止自动重发。")
             self._record_send_failure()
-            return ApprovalResult(job.job_id, ReplyJobStatus.FAILED, False, "发送文本失败。")
+            return ApprovalResult(job.job_id, ReplyJobStatus.HANDOFF, False, "发送结果无法确认，已转人工核对。")
         self._consecutive_send_failures = 0
         if first_contact_reserved:
             mark_first_contact = getattr(
@@ -1748,6 +1940,24 @@ class CustomerServiceWorker:
         failure_reason: str | None = None,
     ) -> _PendingJob:
         updated = replace(job, status=transition_reply(job.status, status))
+        logger.info(
+            "CS_TRACE %s",
+            json.dumps(
+                {
+                    "event": "job_transition",
+                    "job_id": job.job_id,
+                    "from": job.status.value,
+                    "to": status.value,
+                }
+            ),
+        )
+        if status in {
+            ReplyJobStatus.READING_CONTEXT,
+            ReplyJobStatus.GENERATING,
+            ReplyJobStatus.POLICY_CHECK,
+            ReplyJobStatus.SENDING,
+        }:
+            self._set_phase(status.value)
         self._jobs[job.job_id] = updated
         draft = updated.draft or ReplyDraft(
             job_id=updated.job_id,
@@ -1892,6 +2102,12 @@ class CustomerServiceWorker:
                         updated_at=now,
                     )
                     continue
+                if self._has_known_order(state.conversation_key, snapshot):
+                    self._repository.cancel_sales_follow_up(
+                        state.conversation_key,
+                        updated_at=now,
+                    )
+                    continue
                 last_message = snapshot.last_message
                 if (
                     last_message is None
@@ -1905,8 +2121,11 @@ class CustomerServiceWorker:
                     )
                     continue
                 text = (state.follow_up_text or "").strip()
+                if state.stage is SalesStage.PRICE_FOLLOW_UP:
+                    text = _configured_price_silence_follow_up(self._repository)
                 if (
                     not text
+                    or _contains_vehicle_nudge(text)
                     or len(text) > self._config.max_reply_text_length
                     or self._redactor.redact(text) != text
                 ):
@@ -1946,6 +2165,34 @@ class CustomerServiceWorker:
                     )
                 except Exception:  # noqa: BLE001 - follow-up already verified
                     logger.warning("顾客档案的追问发送状态保存失败。")
+
+    def _has_known_order(
+        self, conversation_key: str, snapshot: ConversationSnapshot
+    ) -> bool:
+        """Stop follow-ups when chat or the saved customer profile shows an order."""
+        order_markers = (*_ORDERED_CUSTOMER_MARKERS, "已拍", "拍下了", "下单了", "已下单", "待付款", "已支付")
+        if any(
+            any(marker in normalize_for_matching(_message_text(message)) for marker in order_markers)
+            for message in snapshot.messages
+            if message.direction is MessageDirection.INCOMING
+        ):
+            return True
+        find_profile = getattr(self._repository, "find_customer_profile_by_conversation", None)
+        if not callable(find_profile):
+            return False
+        try:
+            profile = find_profile(conversation_key)
+        except Exception:  # noqa: BLE001 - do not send when order state cannot be verified
+            logger.warning("追问前查询顾客订单状态失败。")
+            return True
+        return profile is not None and (
+            profile.order_status in {
+                CustomerOrderStatus.PENDING_PAYMENT,
+                CustomerOrderStatus.ORDERED,
+                CustomerOrderStatus.AFTER_SALES,
+            }
+            or profile.lifecycle in {CustomerLifecycle.ORDERED, CustomerLifecycle.AFTER_SALES}
+        )
 
     def _intercept_post_fulfillment(self, snapshot: ConversationSnapshot) -> bool:
         """Persist trusted shipment evidence and stop automation before model/send."""
@@ -2325,7 +2572,7 @@ def _size_model_selections(text: str) -> tuple[tuple[str, str], ...]:
     folded = normalize_for_matching(text)
     selections: list[tuple[str, str]] = []
     for match in _BATTERY_SIZE_MODEL_RE.finditer(folded):
-        size_model = match.group(0)
+        size_model = re.sub(r"\s+", "", match.group(0))
         selection = (size_model, _BATTERY_SIZE_TO_CANONICAL_MODEL[size_model])
         if selection not in selections:
             selections.append(selection)
@@ -2370,9 +2617,11 @@ def _merge_partial_battery_selection(
 
 def _question_focus(text: str) -> str | None:
     folded = normalize_for_matching(text)
-    if any(marker in folded for marker in _PRICE_INQUIRY_MARKERS) or bool(
-        _PRICE_INQUIRY_RE.search(folded)
-    ):
+    if any(marker in folded for marker in _PRICE_INQUIRY_MARKERS):
+        return "多少钱"
+    if any(marker in folded for marker in ("容量", "足容", "健康度")):
+        return "容量和健康度"
+    if _PRICE_INQUIRY_RE.search(folded):
         return "多少钱"
     if any(marker in folded for marker in ("尺寸", "多大", "长宽高")):
         return "尺寸多大"
@@ -2382,8 +2631,6 @@ def _question_focus(text: str) -> str | None:
         return "是否送充电器"
     if "蓝牙" in folded:
         return "蓝牙配置和价格"
-    if any(marker in folded for marker in ("容量", "足容", "健康度")):
-        return "容量和健康度"
     return None
 
 
@@ -2525,6 +2772,92 @@ def _catalog_or_handoff_reply(
             intent="battery_catalog",
         )
     return None
+
+
+def _asks_unspecified_price(query: str, resolved_query: str) -> bool:
+    """Use the saved catalog wording when no battery model has been selected."""
+    folded = normalize_for_matching(query)
+    asks_price = _question_focus(folded) == "多少钱"
+    return asks_price and _battery_selection(resolved_query) is None
+
+
+def _listing_teaser_reply(
+    query: str,
+    resolved_query: str,
+    *,
+    knowledge: ProductKnowledge | None,
+    displayed_price: str | None = None,
+    messages: Sequence[ChatMessage] = (),
+) -> ReplyProposal | None:
+    """Explain a low-priced listing variant without treating it as a SKU quote."""
+    folded = normalize_for_matching(query)
+    refers_to_listing = any(
+        marker in folded
+        for marker in (
+            "标价", "活动价", "页面价", "页面价格", "链接价", "链接价格",
+            "上面标的", "上面的价", "挂的价",
+        )
+    )
+    asks_variant = any(
+        marker in folded for marker in ("哪种", "哪一种", "哪款", "什么型号", "什么电池", "对应什么")
+    )
+    amount_match = re.search(r"(?<!\d)(\d+(?:\.\d{1,2})?)\s*(?:元|块)(?!\d)", folded)
+    if amount_match is None and asks_variant and _battery_selection(query) is None:
+        amount_match = re.search(r"(?<!\d)(\d+(?:\.\d{1,2})?)(?!\d)", folded)
+    amount = None
+    if amount_match is not None:
+        try:
+            amount = parse_money(amount_match.group(1))
+        except PricePolicyError:
+            pass
+    if any(marker in folded for marker in ("便宜", "优惠", "能卖", "能出", "行不行", "砍价", "改价")):
+        return None
+    explicit_page_reference = any(
+        marker in folded for marker in ("页面", "活动价", "链接价", "链接价格", "上面", "挂的价")
+    )
+    if _battery_selection(query) is not None and not explicit_page_reference:
+        return None
+    if not refers_to_listing and (not asks_variant or amount is None):
+        return None
+    if amount_match is not None and any(
+        message.direction is MessageDirection.OUTGOING
+        and re.search(rf"(?<!\d){re.escape(amount_match.group(1))}(?!\d)", _message_text(message))
+        for message in messages
+    ):
+        return None
+    try:
+        page_price = parse_money(displayed_price) if displayed_price else None
+        sku_price = (
+            parse_money(knowledge.listed_price)
+            if knowledge is not None and knowledge.listed_price else None
+        )
+    except PricePolicyError:
+        return None
+    if sku_price is None:
+        return ReplyProposal(
+            reply_text="页面标价对应哪款我确认下",
+            intent="handoff",
+            requires_handoff=True,
+            handoff_reason="页面标价对应的商品规格未匹配到已确认的商品资料。",
+        )
+    if page_price is not None and page_price >= sku_price:
+        return None
+    if not refers_to_listing:
+        if amount is None or amount >= sku_price:
+            return None
+        if page_price is not None and amount != page_price:
+            return None
+    elif amount is not None and page_price is not None and amount != page_price:
+        return None
+    selection = _battery_selection(resolved_query)
+    reply = "页面标价对应低容量款，续航比较低"
+    if selection is not None:
+        reply += f"，不是{selection[1]}这款的价格"
+    return ReplyProposal(reply_text=reply, intent="listing_teaser")
+
+
+def _contains_vehicle_nudge(text: str) -> bool:
+    return re.search(r"二轮\s*还是\s*三轮", normalize_for_matching(text)) is not None
 
 
 def _bluetooth_option_selected(messages: Sequence[ChatMessage]) -> bool:
@@ -2688,6 +3021,47 @@ def _configured_first_contact_message(repository: CustomerServiceRepository) -> 
             logger.warning("首次会话话术超过长度限制；本轮使用默认话术。")
         return FIRST_CONTACT_CATALOG_REPLY
     return normalized
+
+
+def _configured_price_silence_follow_up(repository: CustomerServiceRepository) -> str:
+    """An empty setting disables this optional fixed follow-up."""
+    get_setting = getattr(repository, "get_setting", None)
+    if not callable(get_setting):
+        return ""
+    try:
+        message = str(get_setting(PRICE_SILENCE_FOLLOW_UP_SETTING, "") or "").strip()
+    except Exception:  # noqa: BLE001 - a setting failure must not send a follow-up
+        logger.warning("未下单追问话术读取失败；本轮停用追问。")
+        return ""
+    return message if len(message) <= MAX_PRICE_SILENCE_FOLLOW_UP_LENGTH else ""
+
+
+def _eligible_for_price_silence_follow_up(
+    query: str,
+    proposal: ReplyProposal,
+    semantics: CustomerSemantics,
+    negotiation_plan: NegotiationPlan | None,
+) -> bool:
+    """Schedule only after a plain price inquiry was answered."""
+    folded = normalize_for_matching(query)
+    return (
+        _question_focus(query) == "多少钱"
+        and not proposal.requires_handoff
+        and proposal.intent not in {"handoff", "warranty", "price_negotiation"}
+        and (
+            negotiation_plan is None
+            or (
+                negotiation_plan.outcome == "quote"
+                and negotiation_plan.customer_offer is None
+                and not negotiation_plan.is_order_request
+            )
+        )
+        and not semantics.is_order_request
+        and not semantics.is_negotiation
+        and not any(marker in folded for marker in _AFTER_SALES_CUSTOMER_MARKERS)
+        and not any(marker in folded for marker in _PRICE_CHANGE_REQUEST_MARKERS)
+        and not any(marker in folded for marker in _ORDERED_CUSTOMER_MARKERS)
+    )
 
 
 def _contains_first_contact_catalog(text: str, message: str | None = None) -> bool:

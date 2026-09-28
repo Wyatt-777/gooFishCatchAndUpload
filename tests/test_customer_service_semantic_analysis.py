@@ -40,6 +40,15 @@ def test_range_comparison_numbers_are_not_money() -> None:
     )
 
 
+def test_spaced_6030_is_a_battery_model_not_ambiguous_money() -> None:
+    semantics = analyze_customer_turn("60 30")
+
+    assert semantics.battery_model == "60V30Ah"
+    assert semantics.money_offer is None
+    assert semantics.ambiguities == ()
+    assert semantics.needs_model_resolution is False
+
+
 def test_range_requirement_in_price_question_is_not_an_offer() -> None:
     semantics = analyze_customer_turn("60伏20安，25公里的多少钱")
 

@@ -110,6 +110,16 @@ _ROUTINE_INTENTS = frozenset(
 _VEHICLE_MARKERS = ("二轮", "三轮", "车型", "电动车", "电机")
 _RANGE_MARKERS = ("续航", "跑多远", "公里", "通勤", "长途")
 _QUESTION_RE = re.compile(r"[?？]")
+_BUYING_MARKERS = (
+    "想买", "我要买", "我要一组", "我要一套", "我要这款",
+    "要一组", "要一套", "能装就要", "确定要", "打算买",
+)
+_DECLINE_MARKERS = (
+    "不买", "不要了", "不要一组", "不要一套", "先不", "再看看", "考虑一下", "算了",
+)
+_HOW_TO_BUY_MARKERS = ("怎么拍", "怎么买", "怎么下单", "在哪里拍", "如何下单")
+_FIT_CONDITION_MARKERS = ("能装就要", "能用就要", "合适就要", "合适就买")
+_ORDER_HELP_MARKERS = ("拍下", "下单", "付款", "改价", "链接拍", "直接拍")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +129,85 @@ class SalesPlan:
     proposal: ReplyProposal
     stage: SalesStage
     follow_up_text: str | None = None
+
+
+def build_checkout_guidance_plan(
+    query: str,
+    proposal: ReplyProposal,
+    knowledge: ProductKnowledge | None,
+    messages: Sequence[ChatMessage],
+    *,
+    negotiation_active: bool,
+    selected_model: str | None,
+    quantity: int,
+    recent_merchant_replies: Sequence[str] = (),
+) -> SalesPlan:
+    """Optional restrained checkout guidance; the existing plan remains the default."""
+    del messages
+    folded = normalize_for_matching(query)
+    reply = normalize_for_matching(proposal.reply_text)
+    if (
+        proposal.requires_handoff
+        or proposal.intent in {"handoff", "warranty", "battery_catalog"}
+        or proposal.intent in _ROUTINE_INTENTS
+        or negotiation_active
+        or any(marker in folded for marker in _NO_SALES_MARKERS)
+        or any(marker in folded for marker in _DECLINE_MARKERS)
+        or any(marker in folded for marker in _TRANSACTION_MARKERS)
+        or any(marker in reply for marker in _TRANSACTION_REPLY_MARKERS)
+    ):
+        return SalesPlan(proposal, SalesStage.PAUSED)
+
+    wants_to_buy = any(marker in folded for marker in _BUYING_MARKERS)
+    asks_how = any(marker in folded for marker in _HOW_TO_BUY_MARKERS)
+    if not (wants_to_buy or asks_how):
+        return SalesPlan(proposal, SalesStage.PAUSED)
+
+    if selected_model is None:
+        if _QUESTION_RE.search(proposal.reply_text) or "哪个型号" in reply:
+            follow_up = (
+                "型号发我下 我帮你确认" if "哪个型号" in reply else None
+            )
+            return SalesPlan(proposal, SalesStage.QUALIFY, follow_up)
+        enhanced = _append_once(proposal, "你要哪个型号", recent_merchant_replies)
+        return SalesPlan(
+            enhanced,
+            SalesStage.QUALIFY,
+            "型号发我下 我帮你确认" if enhanced != proposal else None,
+        )
+
+    if any(marker in folded for marker in _FIT_CONDITION_MARKERS):
+        if _QUESTION_RE.search(proposal.reply_text):
+            return SalesPlan(proposal, SalesStage.QUALIFY)
+        if "电池仓尺寸" in reply:
+            return SalesPlan(proposal, SalesStage.QUALIFY)
+        enhanced = _append_once(
+            proposal, "电池仓尺寸发我下 我帮你核", recent_merchant_replies
+        )
+        return SalesPlan(
+            enhanced,
+            SalesStage.QUALIFY,
+            "电池仓尺寸方便发我下吗" if enhanced != proposal else None,
+        )
+
+    if (
+        knowledge is None
+        or not knowledge.listed_price
+        or quantity != 1
+        or not _knowledge_matches_model(knowledge, selected_model)
+        or _QUESTION_RE.search(proposal.reply_text)
+        or any(marker in reply for marker in _ORDER_HELP_MARKERS)
+    ):
+        return SalesPlan(proposal, SalesStage.PAUSED)
+
+    enhanced = _append_once(proposal, "在这个链接拍就行", recent_merchant_replies)
+    return SalesPlan(enhanced, SalesStage.CLOSE)
+
+
+def _knowledge_matches_model(knowledge: ProductKnowledge, model: str) -> bool:
+    candidates = (knowledge.name, knowledge.specifications, *knowledge.aliases)
+    normalized_model = normalize_for_matching(model)
+    return any(normalized_model in normalize_for_matching(item) for item in candidates)
 
 
 def build_sales_plan(
@@ -164,11 +253,7 @@ def build_sales_plan(
     qualification_already_asked = asked_vehicle or asked_range
 
     if proposal.intent == "battery_catalog":
-        return SalesPlan(
-            proposal,
-            SalesStage.RECOMMEND,
-            "你是二轮还是三轮，平时想跑多少公里？我按用途给你配",
-        )
+        return SalesPlan(proposal, SalesStage.RECOMMEND)
 
     sales_question = proposal.intent in {
         "price",
@@ -176,7 +261,11 @@ def build_sales_plan(
         "recommendation",
         "battery_recommendation",
     } or any(marker in folded for marker in _SALES_QUESTION_MARKERS)
-    if not sales_question or qualification_already_asked:
+    customer_asks_fit_or_range = any(
+        marker in folded
+        for marker in ("二轮", "三轮", "车型", "适配", "能装", "能用", "续航", "跑多远", "公里")
+    )
+    if not sales_question or not customer_asks_fit_or_range or qualification_already_asked:
         return SalesPlan(proposal, SalesStage.PAUSED)
 
     if knowledge is None:
@@ -200,7 +289,7 @@ def build_sales_plan(
         and not asked_vehicle
         and not _QUESTION_RE.search(proposal.reply_text)
     ):
-        nudge = "你是二轮还是三轮？我再帮你核下适配和续航"
+        nudge = "你平时用什么车型？我帮你核下适配"
         enhanced = _append_once(proposal, nudge, recent_merchant_replies)
         return SalesPlan(
             enhanced,

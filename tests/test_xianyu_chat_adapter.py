@@ -320,6 +320,17 @@ def test_read_only_adapter_reads_changed_conversations_messages_product_and_medi
     assert adapter.request_voice_transcript("message-4") == "这是转写文本"
 
 
+def test_read_conversation_captures_visible_activity_price() -> None:
+    page = FakePage()
+    page.product.text = "测试商品 活动价¥240.00 含运费0.00元"
+    adapter = _adapter(page)
+
+    adapter.open_conversation("conversation-1")
+    snapshot = adapter.read_conversation()
+
+    assert snapshot.displayed_listing_price == "240.00"
+
+
 def test_adapter_reads_fulfillment_platform_tips_separately_from_chat_messages() -> None:
     page = FakePage()
     page.system_messages = [

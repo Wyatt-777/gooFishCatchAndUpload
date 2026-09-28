@@ -53,7 +53,12 @@ _REPLY_JOB_TRANSITIONS: dict[ReplyJobStatus, frozenset[ReplyJobStatus]] = {
         }
     ),
     ReplyJobStatus.SENDING: frozenset(
-        {ReplyJobStatus.AWAITING_REVIEW, ReplyJobStatus.SENT, ReplyJobStatus.FAILED}
+        {
+            ReplyJobStatus.AWAITING_REVIEW,
+            ReplyJobStatus.SENT,
+            ReplyJobStatus.HANDOFF,
+            ReplyJobStatus.FAILED,
+        }
     ),
     ReplyJobStatus.SENT: frozenset(),
     ReplyJobStatus.HANDOFF: frozenset(),
