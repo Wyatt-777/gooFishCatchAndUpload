@@ -25,12 +25,14 @@ class ProductTable(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("productCatalog")
         self.context_label = QLabel("商品列表")
         self.context_label.setObjectName("productSectionTitle")
         self.helper_label = QLabel("完成上方第 2 步后，导入的商品会显示在这里。")
         self.helper_label.setObjectName("mutedText")
 
         self.table = QTableWidget(0, len(self._HEADERS))
+        self.table.setObjectName("productCatalogTable")
         self.table.setHorizontalHeaderLabels(self._HEADERS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)

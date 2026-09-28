@@ -131,6 +131,7 @@ class MainWindow(QMainWindow):
         """Keep all daily actions together so the user need not navigate tabs."""
 
         page = QWidget()
+        page.setObjectName("workflowPage")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -140,12 +141,14 @@ class MainWindow(QMainWindow):
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("browserSettingsPage")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(12)
         layout.addWidget(self.browser_connection_panel)
 
         data_group = QGroupBox("本地数据")
+        data_group.setObjectName("localDataCard")
         data_form = QFormLayout(data_group)
         data_form.addRow("商品会话：", QLabel("SQLite 本地缓存（可在“历史抓取”中查看）"))
         data_form.addRow("图片：", QLabel("写入 output/images/ 目录"))

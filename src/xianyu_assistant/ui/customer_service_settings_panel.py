@@ -139,6 +139,7 @@ class CustomerServiceSettingsPanel(QWidget):
         self.config_status_label.setWordWrap(True)
 
         api_group = QGroupBox("DeepSeek 配置")
+        api_group.setObjectName("modelSettingsCard")
         api_form = QFormLayout(api_group)
         api_form.addRow("Base URL：", self.base_url_input)
         api_form.addRow("文本模型：", self.text_model_input)
@@ -171,6 +172,7 @@ class CustomerServiceSettingsPanel(QWidget):
         first_contact_buttons.addWidget(self.reset_first_contact_message_button)
         first_contact_buttons.addStretch()
         first_contact_group = QGroupBox("首次对话固定话术")
+        first_contact_group.setObjectName("firstContactCard")
         first_contact_layout = QVBoxLayout(first_contact_group)
         first_contact_hint = QLabel(
             "仅在与顾客真正首次对话时发送一次；保存后立即对新的首次会话生效，"
@@ -198,6 +200,7 @@ class CustomerServiceSettingsPanel(QWidget):
         price_follow_up_buttons.addWidget(self.clear_price_silence_follow_up_button)
         price_follow_up_buttons.addStretch()
         price_follow_up_group = QGroupBox("问价后未下单固定追问")
+        price_follow_up_group.setObjectName("priceFollowUpCard")
         price_follow_up_layout = QVBoxLayout(price_follow_up_group)
         price_follow_up_hint = QLabel(
             "仅全自动客服使用。顾客问价、客服回复后，如果顾客没有再发消息且没有已知下单记录，"
@@ -224,6 +227,7 @@ class CustomerServiceSettingsPanel(QWidget):
         product_buttons.addWidget(self.delete_product_button)
         product_buttons.addStretch()
         product_group = QGroupBox("商品知识与最低价")
+        product_group.setObjectName("productKnowledgeCard")
         product_layout = QVBoxLayout(product_group)
         product_hint = QLabel(
             "优先使用当前登录账号自动整理：商品信息按商品归并，聊天正文仅保存在本地并先做隐私脱敏。"
@@ -244,6 +248,7 @@ class CustomerServiceSettingsPanel(QWidget):
         media_buttons.addWidget(self.delete_media_button)
         media_buttons.addStretch()
         media_group = QGroupBox("已登记本地图片（本阶段只登记，不发送）")
+        media_group.setObjectName("mediaAssetsCard")
         media_layout = QVBoxLayout(media_group)
         media_layout.addWidget(self.media_table)
         media_layout.addLayout(media_buttons)
@@ -260,6 +265,7 @@ class CustomerServiceSettingsPanel(QWidget):
         import_buttons.addWidget(self.import_button)
         import_buttons.addStretch()
         import_group = QGroupBox("历史聊天导入")
+        import_group.setObjectName("historyImportCard")
         import_layout = QVBoxLayout(import_group)
         import_layout.addWidget(self.import_path_label)
         import_layout.addWidget(self.import_preview_label)
@@ -279,6 +285,7 @@ class CustomerServiceSettingsPanel(QWidget):
         knowledge_buttons.addWidget(self.import_knowledge_button)
         knowledge_buttons.addStretch()
         knowledge_group = QGroupBox("清洗知识库导入")
+        knowledge_group.setObjectName("knowledgeImportCard")
         knowledge_layout = QVBoxLayout(knowledge_group)
         knowledge_layout.addWidget(self.knowledge_path_label)
         knowledge_layout.addWidget(self.knowledge_preview_label)
@@ -298,6 +305,7 @@ class CustomerServiceSettingsPanel(QWidget):
         maintenance_buttons.addWidget(self.cleanup_audit_button)
         maintenance_buttons.addStretch()
         maintenance_group = QGroupBox("本地数据与清理")
+        maintenance_group.setObjectName("maintenanceCard")
         maintenance_layout = QVBoxLayout(maintenance_group)
         maintenance_layout.addWidget(maintenance_hint)
         maintenance_layout.addLayout(maintenance_buttons)

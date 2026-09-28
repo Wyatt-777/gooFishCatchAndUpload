@@ -29,31 +29,33 @@ class SellerSourcePanel(QWidget):
             """
             QWidget#sellerWorkflow { background: transparent; border: none; }
             QFrame#workflowShell {
-                background: #ffffff;
-                border: 1px solid #dce4ef;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                            stop:0 #ffffff, stop:1 #f5f8ff);
+                border: 1px solid #cbdcf6;
+                border-left: 3px solid #315fd7;
                 border-radius: 14px;
             }
-            QFrame#workflowDivider { background: #e5ebf3; max-width: 1px; }
-            QLabel#workflowTitle { color: #172033; font-size: 21px; font-weight: 700; }
-            QLabel#workflowSubtitle { color: #68778c; }
-            QLabel#stepCaption { color: #728198; font-size: 12px; font-weight: 700; }
-            QLabel#stepTitle { color: #27364b; font-size: 15px; font-weight: 700; }
-            QLabel#stepHint { color: #68778c; }
+            QFrame#workflowDivider { background: #e2e9f3; max-width: 1px; }
+            QLabel#workflowTitle { color: #1b2940; font-size: 21px; font-weight: 700; }
+            QLabel#workflowSubtitle { color: #64758d; }
+            QLabel#stepCaption { color: #718099; font-size: 12px; font-weight: 700; }
+            QLabel#stepTitle { color: #293d5c; font-size: 15px; font-weight: 700; }
+            QLabel#stepHint { color: #64758d; }
             QLabel#progressPill {
-                background: #edf4ff;
-                border: 1px solid #cfddf7;
+                background: #edf2ff;
+                border: 1px solid #ccdafa;
                 border-radius: 12px;
-                color: #2f6bcf;
+                color: #2854ba;
                 font-size: 12px;
                 font-weight: 700;
                 padding: 3px 9px;
             }
             QFrame#quantityControl {
-                background: #fbfdff;
-                border: 1px solid #cbd6e4;
+                background: #ffffff;
+                border: 1px solid #cbd7e7;
                 border-radius: 8px;
             }
-            QFrame#quantityControl:focus-within { border: 2px solid #4b82ee; }
+            QFrame#quantityControl:focus-within { border: 2px solid #416ee0; }
             QPushButton#quantityButton {
                 background: transparent;
                 border: none;
@@ -65,18 +67,18 @@ class SellerSourcePanel(QWidget):
                 min-width: 28px;
                 padding: 0;
             }
-            QPushButton#quantityButton:hover { background: #edf4ff; color: #2f6fed; }
+            QPushButton#quantityButton:hover { background: #edf2ff; color: #315fd7; }
             QPushButton#quantityButton:disabled { background: transparent; color: #cbd6e4; }
             QSpinBox#quantityInput {
                 background: transparent;
                 border: none;
-                color: #172033;
+                color: #1b2940;
                 font-weight: 600;
                 min-height: 28px;
                 padding: 0 2px;
             }
             QSpinBox#quantityInput:focus { border: none; }
-            QLabel#quantityUnit { color: #68778c; }
+            QLabel#quantityUnit { color: #64758d; }
             """
         )
 

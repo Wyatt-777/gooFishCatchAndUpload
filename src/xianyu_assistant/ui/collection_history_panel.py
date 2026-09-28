@@ -52,6 +52,7 @@ class CollectionHistoryPanel(QWidget):
         header.addWidget(self.refresh_button, alignment=Qt.AlignmentFlag.AlignTop)
 
         self.table = QTableWidget(0, len(self._HEADERS))
+        self.table.setObjectName("collectionHistoryTable")
         self.table.setHorizontalHeaderLabels(self._HEADERS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)

@@ -269,6 +269,7 @@ class CustomerServicePanel(QWidget):
         subtitle.setObjectName("pageSubtitle")
 
         control_group = QGroupBox("运行控制")
+        control_group.setObjectName("receptionControls")
         control_group.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Fixed,
@@ -323,6 +324,7 @@ class CustomerServicePanel(QWidget):
         control_layout.addWidget(self.activity_label)
 
         self.price_change_group = QGroupBox("订单改价 · 审核与记录")
+        self.price_change_group.setObjectName("priceChangeCard")
         price_layout = QVBoxLayout(self.price_change_group)
         price_layout.setSpacing(7)
         self.price_hint = QLabel(
@@ -419,6 +421,7 @@ class CustomerServicePanel(QWidget):
             QSizePolicy.Policy.Ignored,
         )
         self.draft_group = QGroupBox("回复草稿与状态")
+        self.draft_group.setObjectName("draftStatusCard")
         draft_layout = QVBoxLayout(self.draft_group)
         self.draft_empty_state = self._build_table_empty_state(
             "暂无待处理草稿",
@@ -433,6 +436,7 @@ class CustomerServicePanel(QWidget):
         draft_layout.addWidget(draft_content)
 
         self.handoff_group = QGroupBox("转人工通知")
+        self.handoff_group.setObjectName("handoffCard")
         handoff_layout = QVBoxLayout(self.handoff_group)
         self.handoff_hint = QLabel(
             "程序内提醒 · 暂无待处理通知\n其他顾客的接待不会受到影响。"
@@ -489,6 +493,7 @@ class CustomerServicePanel(QWidget):
         handoff_layout.addLayout(handoff_actions)
 
         edit_group = QGroupBox("草稿编辑与复核")
+        edit_group.setObjectName("draftEditCard")
         edit_layout = QVBoxLayout(edit_group)
         self.selected_hint = QLabel("请选择一条待审核草稿。")
         self.selected_hint.setObjectName("sectionHint")

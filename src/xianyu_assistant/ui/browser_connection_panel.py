@@ -36,6 +36,7 @@ class BrowserConnectionPanel(QGroupBox):
 
     def __init__(self, settings_store: BrowserSettingsStore | None = None) -> None:
         super().__init__("浏览器连接（Chrome / Edge）")
+        self.setObjectName("browserConnectionCard")
         self._settings_store = settings_store
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65_535)
@@ -43,6 +44,8 @@ class BrowserConnectionPanel(QGroupBox):
         self.port_input.setAccessibleName("CDP 调试端口")
 
         self.status_label = QLabel("未连接")
+        self.status_label.setObjectName("browserConnectionStatus")
+        self.status_label.setProperty("tone", "neutral")
         self.launch_button = QPushButton("启动 Chrome 并连接")
         self.launch_button.setObjectName("primaryAction")
         self.connect_button = QPushButton("连接并打开闲鱼")
@@ -96,13 +99,13 @@ class BrowserConnectionPanel(QGroupBox):
         if self._settings_store is not None:
             self._settings_store.set_setting("browser_cdp_port", str(self.port_input.value()))
         if show_status:
-            self.status_label.setText(f"端口已保存：{self.port_input.value()}")
+            self._set_status(f"端口已保存：{self.port_input.value()}", tone="neutral")
 
     def set_connecting(self) -> None:
         """Prevent duplicate attempts while a worker is contacting the browser."""
         self.launch_button.setEnabled(False)
         self.connect_button.setEnabled(False)
-        self.status_label.setText("正在连接…")
+        self._set_status("正在连接…", tone="neutral")
 
     def set_idle(self) -> None:
         """Allow a new connection attempt after the worker finishes."""
@@ -113,15 +116,21 @@ class BrowserConnectionPanel(QGroupBox):
         """Show that the application is preparing the managed browser profile."""
         self.launch_button.setEnabled(False)
         self.connect_button.setEnabled(False)
-        self.status_label.setText("正在启动 Chrome…")
+        self._set_status("正在启动 Chrome…", tone="neutral")
 
     def set_connected(self, page_url: str) -> None:
         """Show the final page address returned by the browser."""
-        self.status_label.setText(f"已连接：{page_url}")
+        self._set_status(f"已连接：{page_url}", tone="success")
 
     def set_connection_error(self, message: str) -> None:
         """Display an actionable connection error without a modal interruption."""
+        self._set_status(message, tone="error")
+
+    def _set_status(self, message: str, *, tone: str) -> None:
         self.status_label.setText(message)
+        self.status_label.setProperty("tone", tone)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
 
 
 def _default_cdp_port() -> int:

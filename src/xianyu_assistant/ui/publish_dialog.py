@@ -28,6 +28,7 @@ class PublishDialog(QDialog):
     def __init__(self, product: ProductRecord) -> None:
         super().__init__()
         self._product = product
+        self.setObjectName("publishReviewDialog")
         self.setWindowTitle("发布前确认")
         self.setMinimumWidth(560)
         self.resize(680, 620)
@@ -35,14 +36,18 @@ class PublishDialog(QDialog):
         self.price_input = QLineEdit(product.price)
         self.description_input = QTextEdit(product.description)
         self.description_preview_label = QLabel()
+        self.description_preview_label.setObjectName("publishPreviewMeta")
         self.description_preview_label.setWordWrap(True)
         self.category_input = QLineEdit(product.category)
         self.category_input.setPlaceholderText("请在发布页手动选择分类")
         self.category_path_label = QLabel(self._category_path_summary())
+        self.category_path_label.setObjectName("publishPreviewMeta")
         self.category_path_label.setWordWrap(True)
         self.attributes_label = QLabel(self._attribute_summary())
+        self.attributes_label.setObjectName("publishPreviewMeta")
         self.attributes_label.setWordWrap(True)
         self.images_label = QLabel(self._image_summary())
+        self.images_label.setObjectName("publishPreviewMeta")
         warning = QLabel(
             "闲鱼当前发布页没有独立标题栏。程序只会写入采集到的宝贝描述、图片和售价；"
             "图片与描述完成后才等待属性规格出现。分类及最后“发布”均须由你手动确认。"
