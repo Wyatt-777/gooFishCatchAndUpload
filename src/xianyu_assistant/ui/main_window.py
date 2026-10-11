@@ -1,6 +1,7 @@
 """Main window for the guided seller-homepage import workflow."""
 
 import os
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer
@@ -30,6 +31,7 @@ from xianyu_assistant.customer_service.current_catalog import install_current_ca
 from xianyu_assistant.debug.artifacts import DebugArtifactWriter
 from xianyu_assistant.domain.models import CollectionTask, TaskStatus
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
+from xianyu_assistant.persistence.seed_data import seed_installed_data
 from xianyu_assistant.persistence.sqlite_repository import SqliteRepository
 from xianyu_assistant.security.credential_store import KeyringCredentialStore
 from xianyu_assistant.services.collection_worker import CollectionWorker
@@ -124,6 +126,7 @@ class MainWindow(QMainWindow):
             lambda message: self.statusBar().showMessage(message, 8_000)
         )
         self.refresh_collection_history()
+        self._safe_close_pending = False
         if auto_start_browser:
             QTimer.singleShot(0, self.start_browser_and_connect)
 
@@ -138,6 +141,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.seller_source_panel)
         layout.addWidget(self.product_table, 1)
         return page
+
+    def closeEvent(self, event) -> None:
+        """Keep the parent window alive until reception and export threads finish."""
+        if not self.customer_service_panel.request_safe_close():
+            event.ignore()
+            if not self._safe_close_pending:
+                self._safe_close_pending = True
+                QTimer.singleShot(250, self._retry_safe_close)
+            return
+        event.accept()
+
+    def _retry_safe_close(self) -> None:
+        self._safe_close_pending = False
+        self.close()
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
@@ -393,8 +410,12 @@ class MainWindow(QMainWindow):
 
 def _default_database_path() -> Path:
     app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "XianyuAssistant"
-    return app_data / "xianyu_assistant.db"
+    database_path = app_data / "xianyu_assistant.db"
+    if getattr(sys, "frozen", False):
+        seed_installed_data(database_path, Path(sys.executable).parent / "seed-data")
+    return database_path
 
 
 def _output_directory() -> Path:
-    return Path.cwd() / "output"
+    app_data = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "XianyuAssistant"
+    return app_data / "output"

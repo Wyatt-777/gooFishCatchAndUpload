@@ -83,6 +83,57 @@ class FakeElement:
         return self.screenshot_bytes
 
 
+def test_virtual_list_scan_advances_without_leaving_user_scroll_position() -> None:
+    class VirtualPage:
+        def __init__(self) -> None:
+            self.top = 0.0
+
+        def evaluate(self, _script: str, arg: object) -> object:
+            if isinstance(arg, str):
+                return {"top": self.top, "height": 300, "viewport": 100}
+            self.top = float(arg["top"])
+            return None
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            pass
+
+    page = VirtualPage()
+    adapter = PlaywrightXianyuChatAdapter(None, REAL_XIANYU_CHAT_CONTRACT)
+    adapter._visible_session_rows = lambda current: [  # type: ignore[method-assign]
+        {"key": f"c{int(current.top // 75)}", "unread": True}
+    ]
+    keys = [item.conversation_key for item in adapter._scan_virtual_page(page, ".list")]
+    assert page.top == 0
+    assert keys == ["c0", "c1", "c2"]
+
+
+def test_virtual_scan_does_not_reopen_old_rows_just_for_their_timestamp() -> None:
+    class VirtualPage:
+        def __init__(self) -> None:
+            self.top = 0.0
+
+        def evaluate(self, _script: str, arg: object) -> object:
+            if isinstance(arg, str):
+                return {"top": self.top, "height": 200, "viewport": 100}
+            self.top = float(arg["top"])
+            return None
+
+        def wait_for_timeout(self, _milliseconds: int) -> None:
+            pass
+
+    page = VirtualPage()
+    adapter = PlaywrightXianyuChatAdapter(None, REAL_XIANYU_CHAT_CONTRACT)
+    adapter._visible_session_rows = lambda current: [  # type: ignore[method-assign]
+        {"key": "old", "operate_timestamp": 1_600_000_000, "unread": False},
+        {"key": "new", "operate_timestamp": 1_600_000_001, "unread": current.top > 0},
+    ]
+
+    found = adapter._scan_virtual_page(page, ".list")
+
+    assert [item.conversation_key for item in found] == ["new"]
+    assert page.top == 0
+
+
 class FakeLocator:
     def __init__(self, elements: list[FakeElement]) -> None:
         self.elements = elements
@@ -409,6 +460,8 @@ def test_approved_text_send_is_verified_by_a_new_outgoing_message() -> None:
     receipt = adapter.send_text("今天可以发出")
 
     assert adapter.verify_outgoing(receipt) is True
+    verified_key = adapter.verified_outgoing_message_key(receipt)
+    assert verified_key and not verified_key.startswith("pending-")
     assert adapter.verify_outgoing(receipt) is False
 
 

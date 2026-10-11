@@ -36,13 +36,15 @@ class BrowserConnectionConfig:
     """Local CDP endpoint settings supplied by the settings page."""
 
     port: int = DEFAULT_CDP_PORT
-    host: str = "localhost"
+    host: str = "127.0.0.1"
     timeout_ms: int = 15_000
 
     @property
     def endpoint_url(self) -> str:
         """Return the HTTP endpoint accepted by Playwright's CDP connector."""
-        return f"http://{self.host}:{self.port}"
+        host = "127.0.0.1" if self.host.lower() == "localhost" else self.host
+        host = f"[{host}]" if ":" in host else host
+        return f"http://{host}:{self.port}"
 
     def validate(self) -> None:
         """Reject unsafe or malformed CDP targets before a network request is made."""
@@ -62,11 +64,17 @@ class BrowserManager:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._owned_page_callback: Callable[[str], None] | None = None
 
     @property
     def is_connected(self) -> bool:
         """Return whether a usable default browser context is attached."""
-        return self._browser is not None and self._context is not None
+        if self._browser is None or self._context is None:
+            return False
+        try:
+            return self._browser.is_connected()
+        except (AttributeError, PlaywrightError, RuntimeError):
+            return False
 
     @property
     def timeout_ms(self) -> int:
@@ -77,6 +85,9 @@ class BrowserManager:
         """Connect to the browser's default context over local CDP."""
         if self.is_connected:
             return
+
+        if self._playwright is not None:
+            self.disconnect()
 
         self._config.validate()
         try:
@@ -107,6 +118,13 @@ class BrowserManager:
         """Open an app-owned tab without navigating a tab the user already has open."""
         context = self._require_context()
         page = context.new_page()
+        if self._owned_page_callback is not None:
+            session = context.new_cdp_session(page)
+            try:
+                info = session.send("Target.getTargetInfo")
+                self._owned_page_callback(str(info["targetInfo"]["targetId"]))
+            finally:
+                session.detach()
         if response_handler is not None:
             page.on("response", response_handler)
         try:
@@ -124,6 +142,32 @@ class BrowserManager:
                 "浏览器已连接，但打开目标页面失败。请检查网络后重试。"
             ) from error
         return page
+
+    def set_owned_page_callback(self, callback: Callable[[str], None] | None) -> None:
+        """Register each newly created page before navigation or interaction."""
+        self._owned_page_callback = callback
+
+    def close_owned_targets(self, target_ids: list[str]) -> None:
+        """Close only IDs recorded by the parent when this application made a page."""
+        if not target_ids:
+            return
+        if self._browser is None:
+            raise BrowserConnectionError("浏览器尚未连接。")
+        session = self._browser.new_browser_cdp_session()
+        try:
+            existing = {item["targetId"] for item in session.send("Target.getTargets")["targetInfos"]}
+            for target_id in target_ids:
+                if target_id in existing:
+                    result = session.send("Target.closeTarget", {"targetId": target_id})
+                    if not result.get("success"):
+                        raise BrowserConnectionError("旧客服专用页未能关闭，已停止新增发送。")
+            remaining = {
+                item["targetId"] for item in session.send("Target.getTargets")["targetInfos"]
+            }
+            if remaining.intersection(target_ids):
+                raise BrowserConnectionError("旧客服专用页仍然存在，已停止新增发送。")
+        finally:
+            session.detach()
 
     def disconnect(self) -> None:
         """Release Playwright resources without closing the user's browser process."""

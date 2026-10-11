@@ -8,6 +8,9 @@ $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $sourceDatabase = Join-Path $env:LOCALAPPDATA "XianyuAssistant\xianyu_assistant.db"
 $assetDirectory = Join-Path $projectRoot "build\installer-assets"
 $stagedDatabase = Join-Path $assetDirectory "xianyu_assistant.db"
+$stagedImages = Join-Path $assetDirectory "images"
+$sourceImages = Join-Path $projectRoot "output\images"
+$previousReleaseImages = Join-Path $projectRoot "dist\XianyuAssistant\output\images"
 $vcRedist = Join-Path $assetDirectory "vc_redist.x64.exe"
 $chromeInstaller = Join-Path $assetDirectory "googlechromestandaloneenterprise64.msi"
 $chineseLanguage = Join-Path $assetDirectory "ChineseSimplified.isl"
@@ -30,7 +33,10 @@ New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null
 
 & $python (Join-Path $PSScriptRoot "stage_installer_data.py") `
     --source $sourceDatabase `
-    --destination $stagedDatabase
+    --destination $stagedDatabase `
+    --images $stagedImages `
+    --allowed-image-root $sourceImages `
+    --allowed-image-root $previousReleaseImages
 if ($LASTEXITCODE -ne 0) {
     throw "业务数据库快照创建失败，退出代码：$LASTEXITCODE"
 }

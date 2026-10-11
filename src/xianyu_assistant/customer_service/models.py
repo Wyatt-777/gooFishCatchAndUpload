@@ -124,6 +124,7 @@ class MessageDirection(StrEnum):
 
     INCOMING = "incoming"
     OUTGOING = "outgoing"
+    UNKNOWN = "unknown"
 
 
 class MessageKind(StrEnum):
@@ -169,7 +170,11 @@ class CustomerServiceConfig:
     sales_follow_up_delay_minutes: int = 30
     sales_follow_up_start_hour: int = 9
     sales_follow_up_end_hour: int = 22
-    checkout_guidance_enabled: bool = False
+    checkout_guidance_enabled: bool = True
+    scan_budget_seconds: float = 5.0
+    max_generation_jobs_per_poll: int = 2
+    max_follow_ups_per_poll: int = 1
+    max_terminal_jobs_in_memory: int = 200
 
     def __post_init__(self) -> None:
         """Normalize enum-like input and reject unsafe runtime parameters."""
@@ -187,6 +192,10 @@ class CustomerServiceConfig:
             "max_model_failures",
             "max_page_health_failures",
             "sales_follow_up_delay_minutes",
+            "scan_budget_seconds",
+            "max_generation_jobs_per_poll",
+            "max_follow_ups_per_poll",
+            "max_terminal_jobs_in_memory",
         )
         for field_name in positive_fields:
             if getattr(self, field_name) <= 0:
@@ -227,6 +236,8 @@ class ConversationSummary:
     product_title: str | None = None
     listed_price: str | None = None
     last_message_text: str | None = None
+    platform_customer_id: str | None = None
+    merchant_account_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.conversation_key.strip():
@@ -244,6 +255,12 @@ class ChatMessage:
     platform_time: datetime | None = None
     observed_at: datetime | None = None
     content_fingerprint: str | None = None
+    role_source: str = "adapter"
+    key_source: str = "adapter"
+    media_source_signature: str | None = None
+    raw_direction: str | None = None
+    role_confidence: str = "trusted"
+    role_evidence_json: str = "{}"
 
     def __post_init__(self) -> None:
         if not self.message_key.strip():
@@ -280,6 +297,11 @@ class ConversationSnapshot:
     product_url: str | None = None
     system_events: tuple[PlatformSystemEvent, ...] = ()
     displayed_listing_price: str | None = None
+    order_state_text: str | None = None
+    platform_order_id: str | None = None
+    platform_customer_id: str | None = None
+    merchant_account_id: str | None = None
+    new_contact_evidence: str | None = None
 
     def __post_init__(self) -> None:
         if not self.conversation_key.strip():
@@ -605,7 +627,7 @@ class HandoffEvent:
             raise ValueError("event_id 必须大于 0。")
         if not self.conversation_key.strip() or not self.reason.strip():
             raise ValueError("转人工通知必须包含会话和原因。")
-        if self.handoff_type not in {"general", "post_delivery"}:
+        if self.handoff_type not in {"general", "post_delivery", "technical_send"}:
             raise ValueError("转人工通知类型无效。")
 
 

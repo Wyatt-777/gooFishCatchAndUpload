@@ -11,6 +11,7 @@ from xianyu_assistant.customer_service.models import (
 from xianyu_assistant.customer_service.sales import (
     build_checkout_guidance_plan,
     build_sales_plan,
+    checkout_guidance_variant_in_text,
 )
 
 
@@ -261,11 +262,135 @@ def test_optional_guidance_only_prompts_checkout_for_confirmed_single_product() 
         quantity=2,
     )
 
-    assert ready.proposal.reply_text == "可以\n在这个链接拍就行"
+    assert ready.proposal.reply_text.startswith("可以\n点右上角“立即购买”")
+    assert "支付密码先别输" in ready.proposal.reply_text
+    assert "改好价格通知你后再付款" in ready.proposal.reply_text
     assert ready.stage is SalesStage.CLOSE
     assert ready.follow_up_text is None
     assert wrong_model.proposal.reply_text == "可以"
     assert multiple.proposal.reply_text == "可以"
+
+
+def test_accepted_bargain_adds_payment_hold_guidance_and_rejected_bargain_does_not() -> None:
+    accepted = build_checkout_guidance_plan(
+        "6020 388可以吗",
+        ReplyProposal("388可以", intent="price_negotiation"),
+        _product(),
+        _incoming("6020 388可以吗"),
+        negotiation_active=True,
+        accepted_negotiation=True,
+        selected_model="60V20Ah",
+        quantity=1,
+    )
+    rejected = build_checkout_guidance_plan(
+        "6020 300可以吗",
+        ReplyProposal("300不行 378可以", intent="price_negotiation"),
+        _product(),
+        _incoming("6020 300可以吗"),
+        negotiation_active=True,
+        selected_model="60V20Ah",
+        quantity=1,
+    )
+    assert checkout_guidance_variant_in_text(accepted.proposal.reply_text) == 0
+    assert rejected.proposal.reply_text == "300不行 378可以"
+
+
+def test_checkout_wording_rotates_for_same_customer_and_skips_placed_order() -> None:
+    first = build_checkout_guidance_plan(
+        "6020怎么拍",
+        ReplyProposal("可以"),
+        _product(),
+        _incoming("6020怎么拍"),
+        negotiation_active=False,
+        selected_model="60V20Ah",
+        quantity=1,
+    )
+    second = build_checkout_guidance_plan(
+        "6020怎么拍",
+        ReplyProposal("可以"),
+        _product(),
+        _incoming("6020怎么拍"),
+        negotiation_active=False,
+        selected_model="60V20Ah",
+        quantity=1,
+        previous_guidance_variant=0,
+        recent_merchant_replies=(first.proposal.reply_text,),
+    )
+    assert checkout_guidance_variant_in_text(second.proposal.reply_text) == 1
+    assert second.proposal.reply_text != first.proposal.reply_text
+    for reply in (first.proposal.reply_text, second.proposal.reply_text):
+        assert "立即购买" in reply
+        assert "支付密码" in reply
+        assert "待付款" in reply
+        assert "改好" in reply
+    placed = build_checkout_guidance_plan(
+        "6020已经拍下待付款",
+        ReplyProposal("我看下订单"),
+        _product(),
+        _incoming("6020已经拍下待付款"),
+        negotiation_active=False,
+        selected_model="60V20Ah",
+        quantity=1,
+    )
+    assert placed.proposal.reply_text == "我看下订单"
+
+
+def test_checkout_guidance_replaces_immediate_payment_and_rotates_existing_template() -> None:
+    conflicting = build_checkout_guidance_plan(
+        "6020 380可以吗",
+        ReplyProposal("380可以，直接付款", intent="price_negotiation"),
+        _product(),
+        _incoming("6020 380可以吗"),
+        negotiation_active=True,
+        accepted_negotiation=True,
+        accepted_price="380",
+        selected_model="60V20Ah",
+        quantity=1,
+    )
+    assert conflicting.proposal.reply_text.startswith("可以，按380元\n")
+    assert "直接付款" not in conflicting.proposal.reply_text
+    assert checkout_guidance_variant_in_text(conflicting.proposal.reply_text) == 0
+
+    repeated = build_checkout_guidance_plan(
+        "6020怎么拍",
+        ReplyProposal(conflicting.proposal.reply_text),
+        _product(),
+        _incoming("6020怎么拍"),
+        negotiation_active=False,
+        selected_model="60V20Ah",
+        quantity=1,
+        previous_guidance_variant=0,
+    )
+    assert checkout_guidance_variant_in_text(repeated.proposal.reply_text) == 1
+    assert repeated.proposal.reply_text.count("立即购买") == 1
+
+
+def test_checkout_guidance_skips_already_ordered_or_paid_customer() -> None:
+    for query in ("6020已经下单", "6020我已支付", "6020下单了"):
+        plan = build_checkout_guidance_plan(
+            query,
+            ReplyProposal("好的"),
+            _product(),
+            _incoming(query),
+            negotiation_active=False,
+            selected_model="60V20Ah",
+            quantity=1,
+        )
+        assert plan.proposal.reply_text == "好的"
+
+
+def test_explicit_purchase_intent_variants_receive_checkout_guidance() -> None:
+    for query in ("6020就这款", "6020我准备拍", "6020我下单"):
+        plan = build_checkout_guidance_plan(
+            query,
+            ReplyProposal("好的"),
+            _product(),
+            _incoming(query),
+            negotiation_active=False,
+            selected_model="60V20Ah",
+            quantity=1,
+        )
+        assert checkout_guidance_variant_in_text(plan.proposal.reply_text) == 0
 
 
 def test_optional_guidance_does_not_push_after_decline_or_model_only_answer() -> None:

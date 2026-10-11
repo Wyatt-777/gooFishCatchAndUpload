@@ -45,8 +45,13 @@ _NO_SALES_MARKERS = (
 _TRANSACTION_MARKERS = (
     "已拍",
     "拍下了",
+    "已下单",
+    "下单了",
+    "已经下单",
     "付款了",
     "已付款",
+    "已支付",
+    "支付了",
     "改价",
     "订单",
     "发货",
@@ -102,6 +107,7 @@ _ROUTINE_INTENTS = frozenset(
         "default_carriers",
         "first_use",
         "order_status",
+        "pickup",
         "shipping",
         "shipping_origin",
         "shipping_restricted",
@@ -113,13 +119,59 @@ _QUESTION_RE = re.compile(r"[?？]")
 _BUYING_MARKERS = (
     "想买", "我要买", "我要一组", "我要一套", "我要这款",
     "要一组", "要一套", "能装就要", "确定要", "打算买",
+    "就要这款", "这款要了", "就这个", "就这款", "可以我就拍", "行的话就拍",
+    "我拍", "我下单", "准备拍", "准备下单", "现在拍", "现在下单",
 )
 _DECLINE_MARKERS = (
     "不买", "不要了", "不要一组", "不要一套", "先不", "再看看", "考虑一下", "算了",
 )
-_HOW_TO_BUY_MARKERS = ("怎么拍", "怎么买", "怎么下单", "在哪里拍", "如何下单")
+_HOW_TO_BUY_MARKERS = (
+    "怎么拍", "怎么买", "怎么下单", "在哪里拍", "如何下单", "怎么操作", "哪里点立即购买",
+)
 _FIT_CONDITION_MARKERS = ("能装就要", "能用就要", "合适就要", "合适就买")
-_ORDER_HELP_MARKERS = ("拍下", "下单", "付款", "改价", "链接拍", "直接拍")
+_CHECKOUT_GUIDANCE_VARIANTS = (
+    "点右上角“立即购买”先提交订单，支付密码先别输，取消这次付款，保留待付款订单。我改好价格通知你后再付款。",
+    "从右上角“立即购买”拍下就行，先不要输入支付密码，退出付款页面让订单保持待付款。等我改好价告诉你，再付款。",
+    "右上角“立即购买”先生成订单，付款这一步先取消，不用输支付密码，也别取消订单。价格我改好后通知你再付。",
+)
+_IMMEDIATE_PAYMENT_MARKERS = (
+    "直接付款", "马上付款", "立即付款", "现在付款", "直接支付", "立即支付",
+    "现在支付", "拍下付款", "拍下就付", "输入支付密码", "输入付款密码",
+)
+
+
+def checkout_guidance_variant_in_text(text: str) -> int | None:
+    """Recognize only a complete application-authored payment sequence."""
+    folded = normalize_for_matching(text)
+    for index, variant in enumerate(_CHECKOUT_GUIDANCE_VARIANTS):
+        if normalize_for_matching(variant) in folded:
+            return index
+    return None
+
+
+def remove_checkout_guidance(text: str) -> str:
+    """Remove pre-order checkout components if an order appeared before sending."""
+    for variant in _CHECKOUT_GUIDANCE_VARIANTS:
+        text = text.replace(variant, "")
+    return "\n".join(line for line in text.splitlines()
+                     if not ("立即购买" in line and any(marker in line for marker in ("拍下", "订单", "付款")))).strip()
+
+
+def _next_checkout_guidance_variant(
+    previous_variant: int | None, recent_merchant_replies: Sequence[str]
+) -> int:
+    blocked = {previous_variant} if previous_variant is not None else set()
+    for reply in reversed(recent_merchant_replies):
+        recent_variant = checkout_guidance_variant_in_text(reply)
+        if recent_variant is not None:
+            blocked.add(recent_variant)
+            break
+    start = (previous_variant + 1) % len(_CHECKOUT_GUIDANCE_VARIANTS) if previous_variant is not None else 0
+    for offset in range(len(_CHECKOUT_GUIDANCE_VARIANTS)):
+        candidate = (start + offset) % len(_CHECKOUT_GUIDANCE_VARIANTS)
+        if candidate not in blocked:
+            return candidate
+    return start
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +193,9 @@ def build_checkout_guidance_plan(
     selected_model: str | None,
     quantity: int,
     recent_merchant_replies: Sequence[str] = (),
+    accepted_negotiation: bool = False,
+    accepted_price: str | None = None,
+    previous_guidance_variant: int | None = None,
 ) -> SalesPlan:
     """Optional restrained checkout guidance; the existing plan remains the default."""
     del messages
@@ -150,7 +205,7 @@ def build_checkout_guidance_plan(
         proposal.requires_handoff
         or proposal.intent in {"handoff", "warranty", "battery_catalog"}
         or proposal.intent in _ROUTINE_INTENTS
-        or negotiation_active
+        or (negotiation_active and not accepted_negotiation)
         or any(marker in folded for marker in _NO_SALES_MARKERS)
         or any(marker in folded for marker in _DECLINE_MARKERS)
         or any(marker in folded for marker in _TRANSACTION_MARKERS)
@@ -160,10 +215,17 @@ def build_checkout_guidance_plan(
 
     wants_to_buy = any(marker in folded for marker in _BUYING_MARKERS)
     asks_how = any(marker in folded for marker in _HOW_TO_BUY_MARKERS)
-    if not (wants_to_buy or asks_how):
+    if not (wants_to_buy or asks_how or accepted_negotiation):
         return SalesPlan(proposal, SalesStage.PAUSED)
 
-    if selected_model is None:
+    if (
+        not accepted_negotiation
+        and not asks_how
+        and any(checkout_guidance_variant_in_text(item) is not None for item in recent_merchant_replies)
+    ):
+        return SalesPlan(proposal, SalesStage.PAUSED)
+
+    if selected_model is None and not accepted_negotiation:
         if _QUESTION_RE.search(proposal.reply_text) or "哪个型号" in reply:
             follow_up = (
                 "型号发我下 我帮你确认" if "哪个型号" in reply else None
@@ -176,7 +238,7 @@ def build_checkout_guidance_plan(
             "型号发我下 我帮你确认" if enhanced != proposal else None,
         )
 
-    if any(marker in folded for marker in _FIT_CONDITION_MARKERS):
+    if not accepted_negotiation and any(marker in folded for marker in _FIT_CONDITION_MARKERS):
         if _QUESTION_RE.search(proposal.reply_text):
             return SalesPlan(proposal, SalesStage.QUALIFY)
         if "电池仓尺寸" in reply:
@@ -194,14 +256,32 @@ def build_checkout_guidance_plan(
         knowledge is None
         or not knowledge.listed_price
         or quantity != 1
-        or not _knowledge_matches_model(knowledge, selected_model)
+        or (not accepted_negotiation and not _knowledge_matches_model(knowledge, selected_model))
         or _QUESTION_RE.search(proposal.reply_text)
-        or any(marker in reply for marker in _ORDER_HELP_MARKERS)
     ):
         return SalesPlan(proposal, SalesStage.PAUSED)
 
-    enhanced = _append_once(proposal, "在这个链接拍就行", recent_merchant_replies)
+    variant = _next_checkout_guidance_variant(previous_guidance_variant, recent_merchant_replies)
+    current_variant = checkout_guidance_variant_in_text(proposal.reply_text)
+    if current_variant is not None:
+        if current_variant == variant:
+            return SalesPlan(proposal, SalesStage.CLOSE)
+        base_reply = proposal.reply_text.replace(
+            _CHECKOUT_GUIDANCE_VARIANTS[current_variant], ""
+        ).strip() or _checkout_fallback(accepted_price)
+    elif any(marker in reply for marker in _IMMEDIATE_PAYMENT_MARKERS):
+        base_reply = _checkout_fallback(accepted_price)
+    else:
+        base_reply = proposal.reply_text.rstrip()
+    enhanced = replace(
+        proposal,
+        reply_text=f"{base_reply}\n{_CHECKOUT_GUIDANCE_VARIANTS[variant]}",
+    )
     return SalesPlan(enhanced, SalesStage.CLOSE)
+
+
+def _checkout_fallback(accepted_price: str | None) -> str:
+    return f"可以，按{accepted_price}元" if accepted_price is not None else "好的"
 
 
 def _knowledge_matches_model(knowledge: ProductKnowledge, model: str) -> bool:

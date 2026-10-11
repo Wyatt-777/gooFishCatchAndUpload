@@ -2,14 +2,16 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic, sleep
 from typing import ClassVar
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QHeaderView
+from PyQt6.QtWidgets import QFileDialog, QHeaderView
 
 import xianyu_assistant.ui.customer_service_panel as panel_module
 from xianyu_assistant.browser.manager import BrowserConnectionConfig
 from xianyu_assistant.customer_service.models import (
+    CustomerServiceConfig,
     PriceChangeDraft,
     PriceChangeStatus,
     ReceptionMode,
@@ -86,6 +88,34 @@ def test_run_thread_connects_browser_before_starting_worker(
     assert managers[0].disconnected is True
 
 
+def test_quality_export_controls_default_to_redacted_bundle(qapp: object, tmp_path: Path) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig())
+    assert panel.quality_export_button.isEnabled()
+    assert panel.quality_range_combo.currentData() == 30
+    assert panel.quality_raw_checkbox.isChecked() is False
+
+
+def test_quality_export_button_creates_bundle(
+    qapp: object, tmp_path: Path, monkeypatch: object,
+) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig())
+    output = tmp_path / "review.zip"
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        QFileDialog, "getSaveFileName", lambda *_args, **_kwargs: (str(output), "ZIP"),
+    )
+    panel.export_quality_records()
+    deadline = monotonic() + 5
+    while panel._quality_export_thread is not None and monotonic() < deadline:
+        qapp.processEvents()
+        sleep(0.01)
+    assert output.is_file()
+    assert panel._quality_export_thread is None
+
+
 class FakeApprovalThread:
     def __init__(self, draft: ReplyDraft) -> None:
         self.draft = draft
@@ -108,7 +138,7 @@ class FakeStartThread:
 
     def __init__(self, *_args: object, mode: ReceptionMode, **_kwargs: object) -> None:
         self.mode = mode
-        self.checkout_guidance_enabled = _kwargs.get("checkout_guidance_enabled", False)
+        self.checkout_guidance_enabled = _kwargs.get("checkout_guidance_enabled", True)
         self.started = False
         self.status_changed = FakeSignal()
         self.drafts_changed = FakeSignal()
@@ -164,8 +194,8 @@ def test_auto_send_cancel_keeps_reception_stopped(
     repository.initialize()
     panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig(port=9333))
     panel.mode_combo.setCurrentIndex(1)
-    assert panel.checkout_guidance_checkbox.isChecked() is False
-    panel.checkout_guidance_checkbox.setChecked(True)
+    assert not hasattr(panel, "checkout_guidance_checkbox")
+    assert CustomerServiceConfig().checkout_guidance_enabled is True
     monkeypatch.setattr(  # type: ignore[attr-defined]
         panel_module.QMessageBox,
         "warning",
@@ -189,7 +219,7 @@ def test_auto_send_confirm_starts_thread_and_locks_mode(
     repository.initialize()
     panel = CustomerServicePanel(repository, lambda: BrowserConnectionConfig(port=9333))
     panel.mode_combo.setCurrentIndex(1)
-    panel.checkout_guidance_checkbox.setChecked(True)
+    assert not hasattr(panel, "checkout_guidance_checkbox")
     monkeypatch.setattr(panel_module, "CustomerServiceRunThread", FakeStartThread)
     monkeypatch.setattr(  # type: ignore[attr-defined]
         panel_module.QMessageBox,
@@ -204,7 +234,6 @@ def test_auto_send_confirm_starts_thread_and_locks_mode(
     assert FakeStartThread.instances[0].checkout_guidance_enabled is True
     assert FakeStartThread.instances[0].started is True
     assert panel.mode_combo.isEnabled() is False
-    assert panel.checkout_guidance_checkbox.isEnabled() is False
     assert "全自动客服" in panel.status_label.text()
     panel._refresh_timer.stop()
 

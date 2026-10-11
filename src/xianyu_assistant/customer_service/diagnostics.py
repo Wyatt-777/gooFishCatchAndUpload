@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 
+from playwright.sync_api import Error as PlaywrightError
+
 from xianyu_assistant.customer_service.privacy import PrivacyRedactor
 
 
@@ -23,7 +25,8 @@ class DiagnosticPage(Protocol):
 class ChatAdapterDiagnostics:
     """Write bounded, local diagnostics without logging chat content."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, metadata_only: bool = False) -> None:
+        self._metadata_only = metadata_only
         self._root = root or (
             Path(os.environ.get("LOCALAPPDATA", str(Path.cwd())))
             / "XianyuAssistant"
@@ -38,6 +41,15 @@ class ChatAdapterDiagnostics:
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
         safe_reason = PrivacyRedactor().redact(reason)[:500]
         try:
+            if self._metadata_only:
+                # Error paths must not issue another potentially stalled DOM call.
+                directory = self._root / f"{stamp}-metadata"
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "metadata.json").write_text(
+                    json.dumps({"reason": safe_reason, "dom_capture": "skipped_on_error"},
+                               ensure_ascii=False, indent=2), encoding="utf-8",
+                )
+                return
             dom = PrivacyRedactor().redact(page.content())[:20_000]
             digest = hashlib.sha256(dom.encode("utf-8")).hexdigest()[:16]
             directory = self._root / f"{stamp}-{digest}"
@@ -48,6 +60,6 @@ class ChatAdapterDiagnostics:
                 encoding="utf-8",
             )
             (directory / "page.png").write_bytes(page.screenshot(type="png"))
-        except (AttributeError, OSError, TypeError, ValueError):
+        except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError):
             # Diagnostics must never interrupt the read-only worker.
             return

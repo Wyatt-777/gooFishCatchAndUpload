@@ -4,6 +4,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QFrame,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
@@ -39,8 +40,16 @@ class ProductTable(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
+        self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setDefaultSectionSize(42)
+        header = self.table.horizontalHeader()
+        for column in (0, 2, 4, 5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+        for column in (1, 3):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch)
+        for column, width in ((0, 84), (2, 148), (4, 120), (5, 150)):
+            header.resizeSection(column, width)
 
         self.empty_state = self._build_empty_state()
         self.content = QWidget()
@@ -109,12 +118,21 @@ class ProductTable(QWidget):
             "可发布辅助" if ready_to_publish else "等待下载图片",
         )
         for column, value in enumerate(values):
-            self.table.setItem(row, column, QTableWidgetItem(value))
+            item = QTableWidgetItem(value)
+            if column in (1, 2, 3):
+                item.setToolTip(value)
+            self.table.setItem(row, column, item)
 
         publish_button = QPushButton("发布辅助" if ready_to_publish else "先下载图片")
+        publish_button.setObjectName("productRowAction")
+        publish_button.setFixedHeight(26)
         publish_button.setEnabled(ready_to_publish)
         publish_button.setToolTip("图片下载完成后，可安全预填发布页；不会自动发布。")
         publish_button.clicked.connect(
             lambda _checked=False, item=product: self.publish_requested.emit(item)
         )
-        self.table.setCellWidget(row, len(values), publish_button)
+        action_cell = QWidget()
+        action_layout = QHBoxLayout(action_cell)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        action_layout.addWidget(publish_button)
+        self.table.setCellWidget(row, len(values), action_cell)

@@ -24,13 +24,16 @@ _REPLY_JOB_TRANSITIONS: dict[ReplyJobStatus, frozenset[ReplyJobStatus]] = {
         {ReplyJobStatus.DEBOUNCING, ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
     ),
     ReplyJobStatus.DEBOUNCING: frozenset(
-        {ReplyJobStatus.READY, ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
+        {ReplyJobStatus.READY, ReplyJobStatus.HANDOFF,
+         ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
     ),
     ReplyJobStatus.READY: frozenset(
-        {ReplyJobStatus.READING_CONTEXT, ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
+        {ReplyJobStatus.READING_CONTEXT, ReplyJobStatus.HANDOFF,
+         ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
     ),
     ReplyJobStatus.READING_CONTEXT: frozenset(
-        {ReplyJobStatus.GENERATING, ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
+        {ReplyJobStatus.GENERATING, ReplyJobStatus.HANDOFF,
+         ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
     ),
     ReplyJobStatus.GENERATING: frozenset(
         {ReplyJobStatus.POLICY_CHECK, ReplyJobStatus.HANDOFF, ReplyJobStatus.SUPERSEDED, ReplyJobStatus.FAILED}
@@ -58,10 +61,11 @@ _REPLY_JOB_TRANSITIONS: dict[ReplyJobStatus, frozenset[ReplyJobStatus]] = {
             ReplyJobStatus.SENT,
             ReplyJobStatus.HANDOFF,
             ReplyJobStatus.FAILED,
+            ReplyJobStatus.SUPERSEDED,  # positive pre-click evidence only
         }
     ),
     ReplyJobStatus.SENT: frozenset(),
-    ReplyJobStatus.HANDOFF: frozenset(),
+    ReplyJobStatus.HANDOFF: frozenset({ReplyJobStatus.SENT}),  # guarded delayed confirmation only
     ReplyJobStatus.SUPERSEDED: frozenset(),
     ReplyJobStatus.FAILED: frozenset(),
 }

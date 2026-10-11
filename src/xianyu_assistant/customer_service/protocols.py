@@ -40,7 +40,11 @@ from xianyu_assistant.customer_service.models import (
 
 
 class TextSendNotPerformedError(RuntimeError):
-    """The page retained the text and no new outgoing message was observed."""
+    """The adapter has positive evidence that no submission was performed."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class PriceChangeNotPerformedError(RuntimeError):
@@ -410,6 +414,14 @@ class CustomerServiceRepository(Protocol):
 
     def save_sales_state(self, state: SalesState) -> None:
         """Persist one sales stage and its optional at-most-once follow-up."""
+
+    def load_checkout_guidance_variant(self, conversation_key: str) -> int | None:
+        """Read the last verified checkout wording used for this customer."""
+
+    def mark_checkout_guidance_sent(
+        self, conversation_key: str, *, variant: int, sent_at: datetime
+    ) -> None:
+        """Persist checkout wording only after a verified send."""
 
     def cancel_sales_follow_up(self, conversation_key: str, *, updated_at: datetime) -> None:
         """Cancel a pending follow-up because the customer or operator acted."""

@@ -11,8 +11,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from PyQt6.QtCore import QLockFile
 from PyQt6.QtGui import QColor, QPalette
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 from xianyu_assistant.security.credential_store import KeyringCredentialStore
@@ -22,6 +23,9 @@ from xianyu_assistant.ui.main_window import MainWindow
 def main(argv: Sequence[str] | None = None) -> int:
     """Create the Qt application and display the initial main window."""
     arguments = list(argv) if argv is not None else sys.argv
+    if "--browser-worker" in arguments:
+        from xianyu_assistant.browser.executor_child import worker_main
+        return worker_main(arguments)
     if "--self-test" in arguments:
         return _run_packaged_self_test()
     _configure_logging()
@@ -29,9 +33,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     _configure_application_style(app)
     app.setApplicationName("闲鱼铺货助手")
 
+    lock_directory = Path(os.environ.get("LOCALAPPDATA", str(Path.cwd()))) / "XianyuAssistant"
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(lock_directory / "application.lock"))
+    instance_lock.setStaleLockTime(0)
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(None, "闲鱼铺货助手", "程序已经运行，请使用现有窗口。")
+        return 0
     window = MainWindow()
     window.show()
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        instance_lock.unlock()
 
 
 def _run_packaged_self_test() -> int:
@@ -43,6 +57,20 @@ def _run_packaged_self_test() -> int:
             repository = CustomerServiceRepository(Path(directory) / "self-test.db")
             repository.initialize()
             _write_self_test_report(report_path, "sqlite-ready")
+            import httpx
+
+            from xianyu_assistant.browser.executor_supervisor import BrowserExecutorSupervisor
+            from xianyu_assistant.browser.manager import BrowserConnectionConfig
+            from xianyu_assistant.customer_service.browser_adapter import REAL_XIANYU_CHAT_CONTRACT
+
+            supervisor = BrowserExecutorSupervisor(BrowserConnectionConfig())
+            supervisor.set_contract(REAL_XIANYU_CHAT_CONTRACT)
+            result = supervisor.self_test()
+            if not result.get("codec") or result.get("cdp_connected"):
+                raise RuntimeError("浏览器执行进程自检失败。")
+            if not httpx.__version__:
+                raise RuntimeError("HTTP 客户端未打包。")
+            _write_self_test_report(report_path, "executor-ready")
             if not KeyringCredentialStore().available:
                 _write_self_test_report(report_path, "credential-unavailable")
                 return 2
@@ -310,6 +338,19 @@ def _configure_application_style(app: QApplication) -> None:
             color: #2854ba;
         }
         QPushButton#secondaryAction:hover { background: #e3ebff; border-color: #a9bff0; }
+        QPushButton#productRowAction {
+            background: #ffffff;
+            border: 1px solid #bfd0ee;
+            color: #2854ba;
+            min-height: 24px;
+            max-height: 26px;
+            padding: 0 10px;
+        }
+        QPushButton#productRowAction:hover {
+            background: #edf3ff;
+            border-color: #8ca8e7;
+            color: #244cae;
+        }
         QPushButton#linkAction {
             background: transparent;
             border: none;

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from xianyu_assistant.customer_service.importer import ChatHistoryImporter
 from xianyu_assistant.customer_service.models import (
+    ConversationSnapshot,
     ConversationSummary,
     CustomerFulfillmentStatus,
     CustomerIntentLevel,
@@ -48,6 +49,28 @@ def test_customer_profiles_link_only_by_stable_platform_identity(tmp_path: Path)
     assert second.display_name == "买家新昵称"
     assert same_name_without_id.customer_key == "conversation-3"
     assert len(repository.list_customer_profiles()) == 2
+
+
+def test_checkout_guidance_variant_persists_across_conversations_and_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "assistant.db"
+    repository = CustomerServiceRepository(path)
+    repository.initialize()
+    now = datetime(2026, 10, 1, 10, 0, tzinfo=UTC)
+    for key in ("conversation-1", "conversation-2"):
+        repository.observe_customer_summary(
+            ConversationSummary(key),
+            observed_at=now,
+            platform_customer_id="buyer-1",
+        )
+    assert repository.load_checkout_guidance_variant("conversation-2") is None
+
+    repository.mark_checkout_guidance_sent("conversation-1", variant=1, sent_at=now)
+    reopened = CustomerServiceRepository(path)
+    reopened.initialize()
+
+    assert reopened.load_checkout_guidance_variant("conversation-2") == 1
 
 
 def test_delivered_order_lock_is_conversation_scoped_sticky_and_explicitly_restorable(
@@ -764,6 +787,16 @@ def test_first_contact_catalog_reservation_is_persistent_and_at_most_once(
     repository = CustomerServiceRepository(tmp_path / "assistant.db")
     repository.initialize()
     now = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+
+    # Since 0.1.11, an empty local history is insufficient: the platform must
+    # confirm the merchant/buyer identity and that this is a new contact.
+    assert not repository.should_send_first_contact_catalog(
+        "conversation-1", snapshot_has_outgoing=False
+    )
+    repository.observe_contact_snapshot(ConversationSnapshot(
+        "conversation-1", (), merchant_account_id="merchant-1",
+        platform_customer_id="buyer-1", new_contact_evidence="platform_new_session",
+    ), observed_at=now)
 
     assert repository.should_send_first_contact_catalog(
         "conversation-1", snapshot_has_outgoing=False

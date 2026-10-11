@@ -47,3 +47,24 @@ def test_image_manager_keeps_successful_files_when_one_download_fails(tmp_path: 
     assert updated_product.image_paths[0] is not None
     assert Path(updated_product.image_paths[0]).read_bytes() == b"fixture-image"
     assert updated_product.image_paths[1] is None
+
+
+def test_repository_resolves_installer_image_paths_next_to_database(tmp_path: Path) -> None:
+    repository = SqliteRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    task = repository.create_task("测试关键词")
+    repository.save_products(
+        task.id,
+        [ProductCandidate(
+            external_id="installed-image", title="测试商品", price="¥10",
+            description="", category="", url="https://www.goofish.com/item/test",
+            image_urls=("https://img.example/ok.jpg",),
+        )],
+    )
+    image = tmp_path / "images" / "product001" / "image001.jpg"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(b"saved-image")
+    repository.update_image_path(1, 0, "images/product001/image001.jpg")
+
+    product = repository.list_products(task.id)[0]
+    assert product.image_paths == (str(image),)

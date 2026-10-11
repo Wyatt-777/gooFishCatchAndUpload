@@ -273,8 +273,8 @@ class SqliteRepository:
         if row_count != 1:
             raise KeyError(f"未找到商品 {product_id} 的第 {position + 1} 张图片。")
 
-    @staticmethod
     def _build_product_records(
+        self,
         connection: sqlite3.Connection,
         product_rows: list[sqlite3.Row],
     ) -> list[ProductRecord]:
@@ -292,7 +292,10 @@ class SqliteRepository:
         ).fetchall()
         images: defaultdict[int, list[tuple[str, str | None]]] = defaultdict(list)
         for row in image_rows:
-            images[int(row["product_id"])].append((str(row["source_url"]), row["local_path"]))
+            local_path = row["local_path"]
+            if local_path is not None and not Path(local_path).is_absolute():
+                local_path = str(self._database_path.parent / local_path)
+            images[int(row["product_id"])].append((str(row["source_url"]), local_path))
         attribute_rows = connection.execute(
             f"""
             SELECT product_id, name, value FROM product_attributes
@@ -339,7 +342,7 @@ class SqliteRepository:
         ]
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self._database_path)
+        connection = sqlite3.connect(self._database_path, timeout=1.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection

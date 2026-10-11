@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,8 +20,16 @@ from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Error as PlaywrightError
 
 from xianyu_assistant.browser.manager import BrowserManager
+from xianyu_assistant.customer_service.checkout import (
+    binding_matches,
+    current_order_state,
+    order_binding,
+    price_already_changed,
+    reliable_order_binding,
+)
 from xianyu_assistant.customer_service.diagnostics import ChatAdapterDiagnostics
 from xianyu_assistant.customer_service.fingerprints import content_fingerprint
+from xianyu_assistant.customer_service.message_roles import ROLE_READER_JS, resolve_role
 from xianyu_assistant.customer_service.models import (
     ChatMessage,
     ConversationSnapshot,
@@ -51,6 +61,18 @@ class ChatAdapterError(RuntimeError):
 
 class ReadOnlyAdapterError(ChatAdapterError):
     """Raised if a caller attempts a CS-3-forbidden send operation."""
+
+
+class ConversationLookupError(ChatAdapterError):
+    """A bounded lookup failed; the conversation is not proved nonexistent."""
+
+    def __init__(self, message: str, diagnostic: dict[str, object]) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+class ConversationIdentityError(ConversationLookupError):
+    """Rendered activity differs from the expected stable session identity."""
 
 
 class LocatorLike(Protocol):
@@ -158,6 +180,9 @@ class ChatPageSelectors:
     price_change_confirm_selector: str | None = None
     price_change_confirmation_dialog_selector: str | None = None
     price_change_final_confirm_selector: str | None = None
+    order_price_selector: str | None = None
+    order_shipping_price_selector: str | None = None
+    price_dialog_readback_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +250,7 @@ REAL_XIANYU_CHAT_CONTRACT = ChatPageContract(
             'text=/您确定要修改价格吗[？?]?/'
         ),
         price_change_final_confirm_selector='text="确定"',
+        price_dialog_readback_enabled=True,
     ),
 )
 
@@ -247,7 +273,25 @@ class PlaywrightXianyuChatAdapter:
         self._selected_conversation_key: str | None = None
         self._selected_session_info: dict[str, object] | None = None
         self._conversation_scroll_positions: dict[str, float] = {}
+        self._search_positions: dict[str, float] = {}
         self._send_baselines: dict[str, set[str]] = {}
+        self._verified_outgoing_keys: dict[tuple[str, str], str] = {}
+        self._scan_position = 0.0
+        self._send_evidence: dict[str, object] = {}
+        self._send_checkpoint: Callable[[dict[str, object]], None] | None = None
+        self._price_checkpoint: Callable[[dict[str, object]], object] | None = None
+        self._price_evidence: dict[str, object] = {}
+
+    def reset_after_disconnect(self) -> None:
+        """Discard only browser handles; pending worker jobs retain their fingerprints."""
+        self._page = None
+        self._selected_conversation_key = None
+        self._selected_session_info = None
+        self._conversation_scroll_positions.clear()
+        self._search_positions.clear()
+        self._send_baselines.clear()
+        self._verified_outgoing_keys.clear()
+        self._scan_position = 0.0
 
     def open_dedicated_chat_page(self) -> None:
         """Create one application-owned page; never navigate an existing page."""
@@ -258,12 +302,22 @@ class PlaywrightXianyuChatAdapter:
             raise ChatAdapterError("缺少浏览器管理器，无法创建专用客服页。")
         try:
             self._page = self._browser_manager.open_url(self._contract.chat_url)
+            self._page.set_default_timeout(2_000)
         except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError) as error:
             self._diagnostics.record_failure(None, "创建专用客服页失败")
             raise ChatAdapterError("无法创建专用客服页。") from error
 
     def check_page_health(self) -> PageHealth:
         """Detect login, captcha, risk-control, and structural failures."""
+        if self._browser_manager is not None and not self._browser_manager.is_connected:
+            return PageHealth(PageHealthStatus.UNAVAILABLE, "浏览器连接已断开。")
+        if self._page is not None:
+            is_closed = getattr(self._page, "is_closed", None)
+            try:
+                if callable(is_closed) and is_closed():
+                    return PageHealth(PageHealthStatus.UNAVAILABLE, "客服页已关闭。")
+            except (PlaywrightError, RuntimeError):
+                return PageHealth(PageHealthStatus.UNAVAILABLE, "客服页连接已断开。")
         try:
             self._contract.validate()
             page = self._require_page()
@@ -298,6 +352,8 @@ class PlaywrightXianyuChatAdapter:
             return PageHealth(PageHealthStatus.STRUCTURE_CHANGED, str(error))
         except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError):
             self._diagnostics.record_failure(self._page, "客服页面健康检查异常")
+            if self._browser_manager is not None and not self._browser_manager.is_connected:
+                return PageHealth(PageHealthStatus.UNAVAILABLE, "浏览器连接已断开。")
             return PageHealth(PageHealthStatus.STRUCTURE_CHANGED, "客服页面结构或访问异常。")
 
     def list_changed_conversations(self, limit: int) -> list[ConversationSummary]:
@@ -321,26 +377,14 @@ class PlaywrightXianyuChatAdapter:
                 selected_key = self._conversation_key(active, 0)
                 self._selected_conversation_key = selected_key
                 self._selected_session_info = self._session_info(active)
-        for index, item in enumerate(page.locator(selectors.conversation_items).all()):
-            unread = (item.get_attribute(selectors.unread_attribute) or "").casefold() in {
-                "1",
-                "true",
-                "yes",
-            }
-            if selectors.unread_selector and item.locator(selectors.unread_selector).count() > 0:
-                unread = True
-            changed = item.get_attribute(selectors.changed_at_attribute)
-            key = self._conversation_key(item, index)
+        for index, row in enumerate(self._visible_session_rows(page)):
+            key = str(row.get("key") or _fallback_conversation_key(row, index))
+            unread = bool(row.get("unread"))
+            changed = row.get("changed_at")
             is_selected = key == selected_key
             if not unread and not changed and not is_selected:
                 continue
-            summary = self._summary_from_item(
-                item,
-                index,
-                key=key,
-                unread=unread,
-                changed=changed,
-            )
+            summary = self._summary_from_row(row, key)
             if is_selected:
                 selected = summary
             else:
@@ -353,8 +397,53 @@ class PlaywrightXianyuChatAdapter:
                 dict(self._selected_session_info or {}),
                 selected_key,
             )
-        ordered = ([selected] if selected is not None else []) + conversations
-        return ordered[:limit]
+        ordered = [selected] if selected is not None else []
+        if selectors.conversation_scroll_selector and callable(getattr(page, "evaluate", None)):
+            ordered.extend(self._scan_virtual_page(page, selectors.conversation_scroll_selector))
+        ordered.extend(conversations)
+        return list({item.conversation_key: item for item in ordered}.values())[:limit]
+
+    def _scan_virtual_page(self, page: PageLike, holder_selector: str) -> list[ConversationSummary]:
+        """Check a bounded slice of offscreen chats, prioritizing actual unread rows."""
+        metrics = page.evaluate(
+            """selector => { const h = document.querySelector(selector);
+                return h ? {top:h.scrollTop, height:h.scrollHeight, viewport:h.clientHeight} : null;
+            }""",
+            holder_selector,
+        )
+        if not isinstance(metrics, dict):
+            return []
+        viewport = max(_number(metrics.get("viewport"), 0.0), 1.0)
+        bottom = max(_number(metrics.get("height"), 0.0) - viewport, 0.0)
+        original_top = _number(metrics.get("top"), 0.0)
+        scroll_script = """({selector, top}) => { const h = document.querySelector(selector);
+            if (h) { h.scrollTo(0, top); h.dispatchEvent(new Event('scroll', {bubbles:true})); }
+        }"""
+        found: dict[str, ConversationSummary] = {}
+        position = min(self._scan_position, bottom)
+        try:
+            # A session's operateTimeStamp exists even for old, already-read chats.
+            # Treating it as a change made every historic row a candidate and
+            # could block real unread messages behind long open/search cycles.
+            for _ in range(4):
+                page.evaluate(scroll_script, {"selector": holder_selector, "top": position})
+                wait = getattr(page, "wait_for_timeout", None)
+                if callable(wait):
+                    wait(80)
+                for index, row in enumerate(self._visible_session_rows(page)):
+                    if not (row.get("unread") or row.get("changed_at")):
+                        continue
+                    key = str(row.get("key") or _fallback_conversation_key(row, index))
+                    self._conversation_scroll_positions[key] = position
+                    found[key] = self._summary_from_row(row, key)
+                if position >= bottom - 2:
+                    position = 0.0
+                    break
+                position = min(position + max(viewport * 0.75, 100.0), bottom)
+        finally:
+            page.evaluate(scroll_script, {"selector": holder_selector, "top": original_top})
+        self._scan_position = position
+        return list(found.values())
 
     def list_all_conversations(self) -> list[ConversationSummary]:
         """Read every conversation from the virtualized list without sending anything."""
@@ -445,85 +534,77 @@ class PlaywrightXianyuChatAdapter:
         return list(seen.values())
 
     def open_conversation(self, conversation_key: str) -> None:
-        """Select a conversation item without sending or editing content."""
+        """Search one bounded slice, retain per-target progress and restore on failure."""
         page = self._require_ready_page()
-        selectors = self._contract.selectors
-        if self._try_select_visible_conversation(page, conversation_key):
-            return
-        for index, item in enumerate(page.locator(selectors.conversation_items).all()):
-            if self._conversation_key(item, index) == conversation_key:
-                self._select_conversation(page, item, conversation_key)
-                return
-        holder_selector = selectors.conversation_scroll_selector
-        if holder_selector:
-            metrics = page.evaluate(
-                """selector => {
-                    const holder = document.querySelector(selector);
-                    if (!holder) return null;
-                    return {scrollHeight: holder.scrollHeight, clientHeight: holder.clientHeight};
-                }""",
-                holder_selector,
-            )
-            if isinstance(metrics, dict):
-                client_height = max(_number(metrics.get("clientHeight"), 1.0), 1.0)
-                bottom = max(_number(metrics.get("scrollHeight"), 0.0) - client_height, 0.0)
-                known_position = self._conversation_scroll_positions.get(conversation_key)
-                if known_position is not None:
-                    page.evaluate(
-                        """({selector, top}) => {
-                            const holder = document.querySelector(selector);
-                            if (holder) {
-                                holder.scrollTo(0, top);
-                                holder.dispatchEvent(new Event('scroll', {bubbles: true}));
-                            }
-                        }""",
-                        {"selector": holder_selector, "top": known_position},
-                    )
-                    wait_for_timeout = getattr(page, "wait_for_timeout", None)
-                    if callable(wait_for_timeout):
-                        wait_for_timeout(250)
-                    if self._try_select_visible_conversation(page, conversation_key):
-                        return
-                    for index, item in enumerate(page.locator(selectors.conversation_items).all()):
-                        if self._conversation_key(item, index) == conversation_key:
-                            self._select_conversation(page, item, conversation_key)
-                            return
-                position = 0.0
-                for _ in range(1_000):
-                    page.evaluate(
-                        """({selector, top}) => {
-                            const holder = document.querySelector(selector);
-                            if (holder) {
-                                holder.scrollTo(0, top);
-                                holder.dispatchEvent(new Event('scroll', {bubbles: true}));
-                            }
-                        }""",
-                        {"selector": holder_selector, "top": position},
-                    )
-                    wait_for_timeout = getattr(page, "wait_for_timeout", None)
-                    if callable(wait_for_timeout):
-                        wait_for_timeout(250)
-                    for index, item in enumerate(page.locator(selectors.conversation_items).all()):
-                        if self._conversation_key(item, index) == conversation_key:
-                            self._conversation_scroll_positions[conversation_key] = position
-                            self._select_conversation(page, item, conversation_key)
-                            return
-                    if position >= bottom - 2:
-                        break
-                    next_position = min(position + max(client_height * 0.75, 100.0), bottom)
-                    if next_position <= position + 1:
-                        break
-                    position = next_position
-        # A virtualized list can temporarily unmount the selected row. If the
-        # caller is reopening the already selected conversation, the rendered
-        # chat header is sufficient to prove that no switch is needed.
+        deadline = time.monotonic() + 3.0
         try:
             if self._current_conversation_key(page) == conversation_key:
                 self._selected_conversation_key = conversation_key
+                self._search_positions.pop(conversation_key, None)
                 return
+        except ConversationIdentityError:
+            pass
         except ChatAdapterError:
             pass
-        raise ChatAdapterError("未找到指定会话。")
+        if self._try_select_visible_conversation(page, conversation_key):
+            self._search_positions.pop(conversation_key, None)
+            return
+        holder_selector = self._contract.selectors.conversation_scroll_selector
+        diagnostic: dict[str, object] = {
+            "expected_ref": _identity_ref(conversation_key),
+            "budget_exhausted": False, "search_complete": False, "positions_checked": 0,
+        }
+        if not holder_selector:
+            raise ConversationLookupError("当前可见列表未找到目标会话。", diagnostic)
+        metrics = page.evaluate("""selector => {
+            const h=document.querySelector(selector);
+            return h ? {top:h.scrollTop,height:h.scrollHeight,viewport:h.clientHeight} : null;
+        }""", holder_selector)
+        if not isinstance(metrics, dict):
+            raise ConversationLookupError("会话列表容器暂时不可用。", diagnostic)
+        original_top = _number(metrics.get("top"), 0.0)
+        viewport = max(_number(metrics.get("viewport"), 1.0), 1.0)
+        bottom = max(_number(metrics.get("height"), 0.0) - viewport, 0.0)
+        position = min(self._search_positions.get(conversation_key, 0.0), bottom)
+        start_position = position
+        known = self._conversation_scroll_positions.get(conversation_key)
+        scroll = """({selector,top}) => {const h=document.querySelector(selector);
+            if(h){h.scrollTo(0,top);h.dispatchEvent(new Event('scroll',{bubbles:true}));}}"""
+        selected = False
+        try:
+            for step in range(12):
+                if time.monotonic() >= deadline:
+                    diagnostic["budget_exhausted"] = True
+                    break
+                target = min(known, bottom) if step == 0 and known is not None else position
+                page.evaluate(scroll, {"selector": holder_selector, "top": target})
+                wait = getattr(page, "wait_for_timeout", None)
+                if callable(wait):
+                    wait(100)
+                diagnostic["positions_checked"] = step + 1
+                if self._try_select_visible_conversation(page, conversation_key):
+                    self._conversation_scroll_positions[conversation_key] = target
+                    self._search_positions.pop(conversation_key, None)
+                    selected = True
+                    return
+                if step == 0 and known is not None:
+                    continue
+                if position >= bottom - 2:
+                    diagnostic["search_complete"] = start_position <= 1
+                    position = 0.0
+                    break
+                position = min(position + max(viewport * 0.75, 100.0), bottom)
+            else:
+                diagnostic["budget_exhausted"] = True
+        finally:
+            if not selected:
+                if len(self._search_positions) >= 512:
+                    self._search_positions.clear()
+                self._search_positions[conversation_key] = position
+                page.evaluate(scroll, {"selector": holder_selector, "top": original_top})
+        raise ConversationLookupError(
+            "本轮搜索预算内未定位到目标会话；保留进度，禁止向其他会话发送。", diagnostic,
+        )
 
     def _select_conversation(
         self, page: PageLike, item: LocatorLike, conversation_key: str
@@ -549,78 +630,196 @@ class PlaywrightXianyuChatAdapter:
             raise ChatAdapterError("客服页面缺少活动会话身份选择器。")
         wait_for_timeout = getattr(page, "wait_for_timeout", None)
         stable_reads = 0
+        actual_key = None
         for _ in range(20):
-            active = page.locator(selector)
-            if active.count() == 1:
-                try:
-                    actual_key = self._conversation_key(active, 0)
-                except ChatAdapterError:
-                    actual_key = ""
+            count, actual_key = self._active_identity(page)
+            if count == 1:
                 if actual_key == conversation_key:
                     stable_reads += 1
                     if stable_reads >= 2:
                         return
                 else:
                     stable_reads = 0
+            else:
+                stable_reads = 0
             if callable(wait_for_timeout):
                 wait_for_timeout(100)
-        raise ChatAdapterError("页面未确认切换到目标会话，禁止读取或发送。")
+        raise ConversationIdentityError("页面未确认切换到目标会话，禁止读取或发送。", {
+            "expected_ref": _identity_ref(conversation_key),
+            "actual_ref": _identity_ref(actual_key), "identity_reads": 20,
+        })
 
     def _try_select_visible_conversation(self, page: PageLike, conversation_key: str) -> bool:
-        """Match React-backed rows in one DOM evaluation before using dynamic locators."""
-        locator = page.locator(self._contract.selectors.conversation_items)
+        """Resolve stable identity and click in one DOM call, without a stale row index."""
+        selectors = self._contract.selectors
+        locator = page.locator(selectors.conversation_items)
         evaluate_all = getattr(locator, "evaluate_all", None)
-        nth = getattr(locator, "nth", None)
-        if not callable(evaluate_all) or not callable(nth):
+        if not callable(evaluate_all):
+            for index, item in enumerate(locator.all()):
+                if self._conversation_key(item, index) == conversation_key:
+                    self._select_conversation(page, item, conversation_key)
+                    return True
             return False
-        try:
-            rows = evaluate_all(
-                """elements => elements.map((element, index) => {
-                    const attribute = element.getAttribute('data-conversation-key');
-                    const fiberKey = Object.keys(element).find(key => key.startsWith('__reactFiber'));
-                    let fiber = fiberKey ? element[fiberKey] : null;
-                    while (fiber && !(fiber.memoizedProps && fiber.memoizedProps.sessionInfo)) {
-                        fiber = fiber.return;
-                    }
-                    const sessionId = fiber?.memoizedProps?.sessionInfo?.sessionId;
-                    return {index, key: attribute || (sessionId ? `session-${sessionId}` : null)};
-                })"""
-            )
-        except (PlaywrightError, RuntimeError, TypeError, ValueError):
+        result = evaluate_all("""(elements, arg) => {
+            const rows=elements.map(element => {
+                const fk=Object.keys(element).find(k=>k.startsWith('__reactFiber'));
+                let fiber=fk ? element[fk] : null;
+                while(fiber && !(fiber.memoizedProps && fiber.memoizedProps.sessionInfo)) fiber=fiber.return;
+                const s=fiber?.memoizedProps?.sessionInfo;
+                const key=element.getAttribute(arg.attribute) || (s?.sessionId ? `session-${s.sessionId}` : null);
+                return {element,key,s};
+            }).filter(r=>r.key===arg.key && r.element.isConnected);
+            if(rows.length!==1) return {clicked:false,matches:rows.length};
+            const {element,s}=rows[0];
+            const i=s?.itemInfo || {}, x=s?.extension || {};
+            const info=s ? {session_id:s.sessionId,title:s.title,
+                buyer_id:s.buyerId ?? s.buyerUserId ?? s.buyerInfo?.userId ?? s.buyer?.userId,
+                seller_id:s.sellerId ?? s.sellerUserId ?? s.sellerInfo?.userId ?? s.seller?.userId,
+                item_info:{item_id:i.itemId,title:i.title,price:i.price},
+                extension_item_id:x.itemId,extension_item_title:x.itemTitle,
+                summary:{summary_content:s.summary?.summaryContent,time_stamp:s.summary?.timeStamp},
+                operate_timestamp:s.operateTimeStamp,last_message:{message:s.lastMessage?.message},
+                unread:Boolean(s.unread)} : null;
+            element.click();
+            return {clicked:true,info};
+        }""", {"attribute": selectors.conversation_key_attribute, "key": conversation_key})
+        if not isinstance(result, dict) or result.get("clicked") is not True:
             return False
-        if not isinstance(rows, list):
-            return False
-        for row in rows:
-            if not isinstance(row, dict) or row.get("key") != conversation_key:
-                continue
-            index = row.get("index")
-            if not isinstance(index, int):
-                return False
-            self._select_conversation(page, nth(index), conversation_key)
-            return True
-        return False
+        self._wait_for_conversation_selection(page, conversation_key)
+        self._selected_conversation_key = conversation_key
+        self._selected_session_info = result.get("info")
+        return True
+
+    def _active_identity(self, page: PageLike) -> tuple[int, str | None]:
+        selector = self._contract.selectors.active_conversation_selector
+        if not selector:
+            return 0, None
+        active = page.locator(selector)
+        evaluate_all = getattr(active, "evaluate_all", None)
+        if callable(evaluate_all):
+            rows = evaluate_all("""(elements, attribute) => elements.map(e => {
+                const key=e.getAttribute(attribute);
+                if(key) return key;
+                const fk=Object.keys(e).find(k=>k.startsWith('__reactFiber'));
+                let fiber=fk ? e[fk] : null;
+                while(fiber && !(fiber.memoizedProps && fiber.memoizedProps.sessionInfo)) fiber=fiber.return;
+                const id=fiber?.memoizedProps?.sessionInfo?.sessionId;
+                return id ? `session-${id}` : null;
+            })""", self._contract.selectors.conversation_key_attribute)
+            if not isinstance(rows, list):
+                raise ChatAdapterError("活动会话身份读取格式异常。")
+            return len(rows), str(rows[0]) if len(rows)==1 and rows[0] else None
+        count = active.count()
+        return count, self._conversation_key(active, 0) if count == 1 else None
 
     def read_conversation(self) -> ConversationSnapshot:
         """Read the selected conversation and optional product card metadata."""
         page = self._require_ready_page()
         selectors = self._contract.selectors
         messages: list[ChatMessage] = []
-        for index, item in enumerate(page.locator(selectors.message_items).all()):
-            direction = _direction(item, selectors)
-            kind = _kind(item, selectors)
-            text = _item_text(item, selectors.text_selector)
-            message_key = self._message_key(item, index, direction, kind, text)
-            messages.append(
-                ChatMessage(
-                    message_key=message_key,
-                    direction=direction,
-                    kind=kind,
-                    text=text or None,
-                    platform_time=_parse_datetime(item.get_attribute(selectors.platform_time_attribute)),
-                )
-            )
-        product_id, product_title, displayed_price = self._read_product_card(page)
         info = self._selected_session_info or self._session_info_from_page(page)
+        merchant_id = _string(info.get("seller_id")) if info else None
+        buyer_id = _string(info.get("buyer_id")) if info else None
+        first_message_observed = False
+        locator = page.locator(selectors.message_items)
+        evaluate_all = getattr(locator, "evaluate_all", None)
+        if callable(evaluate_all):
+            rows = evaluate_all("(elements,s) => {" + ROLE_READER_JS + """return elements.map((e, index) => {
+                const nested = s.text_selector ? e.querySelectorAll(s.text_selector) : [];
+                const text = (nested.length ? Array.from(nested).map(n => n.innerText || '').join(' ') : e.innerText || '').trim();
+                const role=readRole(e,s);
+                let kind=e.getAttribute(s.kind_attribute);
+                if (!kind && s.image_kind_selector && e.querySelector(s.image_kind_selector)) kind='image';
+                if (!kind && s.voice_kind_selector && e.querySelector(s.voice_kind_selector)) kind='voice';
+                let key=e.getAttribute(s.message_key_attribute);
+                let key_source=key ? 'platform_attribute' : null;
+                let media_source=null;
+                if (kind==='image' || kind==='voice') {
+                    const media=e.querySelector(kind==='image' ? s.image_kind_selector : 'audio, source');
+                    media_source=media && (media.currentSrc || media.getAttribute('src') || media.getAttribute('data-src'));
+                    if (!media_source) {
+                        const fk=Object.keys(e).find(k => k.startsWith('__reactFiber'));
+                        let fiber=fk ? e[fk] : null;
+                        for(let depth=0; fiber && depth<12 && !media_source; depth++,fiber=fiber.return) {
+                            const p=fiber.memoizedProps || {};
+                            for(const v of [p.message,p.messageInfo,p.data]) {
+                                if(!v || typeof v!=='object') continue;
+                                const source=kind==='image' ? (v.imageUrl ?? v.picUrl ?? v.imageId) : (v.voiceUrl ?? v.audioUrl ?? v.voiceId);
+                                if(typeof source==='string' && source) {media_source=source;break;}
+                            }
+                        }
+                    }
+                }
+                if (!key) {
+                    const fk=Object.keys(e).find(k => k.startsWith('__reactFiber'));
+                    let fiber=fk ? e[fk] : null;
+                    for (let depth=0; fiber && depth<12 && !key; depth++, fiber=fiber.return) {
+                        const p=fiber.memoizedProps || {};
+                        for (const v of [p,p.message,p.messageInfo,p.data]) {
+                            if (!v || typeof v !== 'object') continue;
+                            const id=v.messageId ?? v.msgId ?? v.message_id;
+                            if (id!==null && id!==undefined && String(id)) {key='message-'+String(id);key_source='react_message_id';break;}
+                        }
+                    }
+                }
+                return {index,text,role,kind:kind || 'text',key,key_source,media_source,time:e.getAttribute(s.platform_time_attribute)};
+            });}""", {name: getattr(selectors, name) for name in (
+                "text_selector", "direction_attribute", "incoming_direction_selector",
+                "outgoing_direction_selector", "kind_attribute", "image_kind_selector",
+                "voice_kind_selector", "message_key_attribute", "platform_time_attribute",
+            )})
+            fallback_occurrences: dict[str, int] = {}
+            # Message sender IDs can fill explicit session fields that the page
+            # omits; only a single consistent author on each side is accepted.
+            self_ids = {str(r["role"]["sender_id"]) for r in rows
+                        if r.get("role", {}).get("sender_id") and r["role"].get("is_self") is True}
+            buyer_ids = {str(r["role"]["sender_id"]) for r in rows
+                         if r.get("role", {}).get("sender_id") and r["role"].get("is_self") is False}
+            if not merchant_id and len(self_ids) == 1:
+                merchant_id = self_ids.pop()
+            if not buyer_id and len(buyer_ids) == 1:
+                buyer_id = buyer_ids.pop()
+            for row in rows:
+                role = row.get("role") or {}
+                direction, role_source, role_evidence = resolve_role(
+                    role, merchant_id=merchant_id, buyer_id=buyer_id,
+                )
+                if row["index"] == 0 and direction is MessageDirection.INCOMING:
+                    first_message_observed = role.get("first_message") is True
+                try:
+                    kind = MessageKind(str(row["kind"]).casefold())
+                except ValueError:
+                    kind = MessageKind.UNKNOWN
+                text = str(row["text"])
+                signature = f"{direction.value}:{kind.value}:{row['time'] or ''}:{text}"
+                fallback_occurrences[signature] = fallback_occurrences.get(signature, 0) + 1
+                key = row["key"] or hashlib.sha256(
+                    f"{signature}:{fallback_occurrences[signature]}".encode()
+                ).hexdigest()
+                messages.append(ChatMessage(message_key=str(key), direction=direction, kind=kind,
+                                            text=text or None, platform_time=_parse_datetime(row["time"]),
+                                            role_source=role_source,
+                                            raw_direction=role.get("raw_direction"),
+                                            role_confidence="trusted" if direction is not MessageDirection.UNKNOWN else "unknown",
+                                            role_evidence_json=role_evidence,
+                                            key_source=str(row.get("key_source") or "content_fallback"),
+                                            media_source_signature=_media_signature(kind, row.get("media_source"))))
+        else:
+            for index, item in enumerate(locator.all()):
+                direction, role_source, role_evidence = _read_role(item, selectors, merchant_id, buyer_id)
+                kind = _kind(item, selectors)
+                text = _item_text(item, selectors.text_selector)
+                messages.append(ChatMessage(
+                    message_key=self._message_key(item, index, direction, kind, text),
+                    direction=direction, kind=kind, text=text or None,
+                    platform_time=_parse_datetime(item.get_attribute(selectors.platform_time_attribute)),
+                    role_source=role_source, role_confidence="trusted" if direction is not MessageDirection.UNKNOWN else "unknown",
+                    raw_direction=item.get_attribute(selectors.direction_attribute),
+                    role_evidence_json=role_evidence,
+                    key_source="platform_attribute" if item.get_attribute(selectors.message_key_attribute) else "position_fallback",
+                    media_source_signature=self._media_signature_from_item(item, kind),
+                ))
+        product_id, product_title, displayed_price = self._read_product_card(page)
         if info:
             item_info = info.get("item_info")
             if isinstance(item_info, dict):
@@ -628,6 +827,14 @@ class PlaywrightXianyuChatAdapter:
                 product_title = product_title or _string(item_info.get("title"))
                 displayed_price = displayed_price or _string(item_info.get("price"))
         conversation_key = self._current_conversation_key(page)
+        order_state_text = None
+        platform_order_id = None
+        if selectors.product_card:
+            header = page.locator(selectors.product_card)
+            if header.count() == 1:
+                # Restrict to the product/order header, not all historical chat text.
+                order_state_text = header.inner_text().strip() or None
+                platform_order_id = header.get_attribute('data-order-id')
         system_events: list[PlatformSystemEvent] = []
         if selectors.system_message_items:
             for item in page.locator(selectors.system_message_items).all():
@@ -653,6 +860,14 @@ class PlaywrightXianyuChatAdapter:
             product_title=product_title,
             system_events=tuple(system_events),
             displayed_listing_price=displayed_price,
+            order_state_text=order_state_text,
+            platform_order_id=platform_order_id,
+            platform_customer_id=buyer_id,
+            merchant_account_id=merchant_id,
+            new_contact_evidence=("platform_first_message" if first_message_observed
+                                  and merchant_id and buyer_id
+                                  and all(m.direction is MessageDirection.INCOMING for m in messages)
+                                  else None),
         )
 
     def request_voice_transcript(self, message_key: str) -> str | None:
@@ -671,16 +886,20 @@ class PlaywrightXianyuChatAdapter:
                     except TypeError:
                         button.click()
                     menu_items = page.locator(selectors.voice_transcript_menu_selector).all()
+                    matching = []
                     for menu_item in menu_items:
-                        if (
-                            selectors.voice_transcript_menu_text is None
-                            or menu_item.inner_text().strip() == selectors.voice_transcript_menu_text
-                        ):
-                            try:
-                                menu_item.click(force=True, no_wait_after=True)
-                            except TypeError:
-                                menu_item.click()
-                            break
+                        is_visible = getattr(menu_item, "is_visible", None)
+                        if callable(is_visible) and not is_visible():
+                            continue
+                        if (selectors.voice_transcript_menu_text is None
+                                or menu_item.inner_text().strip() == selectors.voice_transcript_menu_text):
+                            matching.append(menu_item)
+                    if len(matching) != 1:
+                        raise ChatAdapterError("语音转文字菜单没有唯一可见选项。")
+                    try:
+                        matching[0].click(no_wait_after=True, timeout=2_000)
+                    except TypeError:
+                        matching[0].click()
                 else:
                     button.click()
         transcript = item.locator(selectors.voice_transcript_selector)
@@ -728,82 +947,271 @@ class PlaywrightXianyuChatAdapter:
             content = image.screenshot(type="png")
         return ImagePayload(message_key=message_key, content=content, mime_type="image/png")
 
-    def send_text(self, text: str) -> SendReceipt:
-        """Send one approved text once, resolving an ambiguous click by readback."""
-        approved_text = text.strip()
-        if not approved_text:
-            raise ChatAdapterError("发送文本不能为空。")
-        page = self._require_ready_page()
-        if not self._selected_conversation_key:
-            raise ChatAdapterError("发送前没有唯一选中的会话。")
+    def set_send_checkpoint(self, callback: Callable[[dict[str, object]], None] | None) -> None:
+        self._send_checkpoint = callback
+        if callback is not None:
+            self._send_evidence = {"stage": "preflight", "click_state": "not_started"}
+
+    def send_evidence(self) -> dict[str, object]:
+        return dict(self._send_evidence)
+
+    def set_price_checkpoint(self, callback: Callable[[dict[str, object]], object] | None) -> None:
+        """Require a durable parent authorization before the final order-price click."""
+        self._price_checkpoint = callback
+        if callback is not None:
+            self._price_evidence = {"stage": "preflight", "click_state": "not_started"}
+
+    def price_evidence(self) -> dict[str, object]:
+        return dict(self._price_evidence)
+
+    def verify_order_price(self, evidence: dict[str, object]) -> bool:
+        """Read the same order's persisted amount; never confirm a readback dialog."""
         selectors = self._contract.selectors
-        if not selectors.message_input_selector or not selectors.send_button_selector:
-            raise ReadOnlyAdapterError("客服页面发送契约尚未配置。")
-        editor = page.locator(selectors.message_input_selector)
-        button = page.locator(selectors.send_button_selector)
-        if editor.count() != 1 or button.count() != 1:
-            raise ChatAdapterError("消息输入框或发送按钮不是唯一节点。")
-
-        baseline = {message.message_key for message in self.read_conversation().messages}
-        fingerprint = content_fingerprint(approved_text)
+        if not reliable_order_binding(evidence) or not all(evidence.get(k) for k in (
+            "approved_price", "shipping_price",
+        )):
+            return False
+        snapshot = self.read_conversation()
+        if not binding_matches(snapshot, evidence):
+            return False
+        if not selectors.order_price_selector or not selectors.order_shipping_price_selector:
+            # A pending-order header is distinct from a pre-order activity price.
+            # Its server-updated amount corroborates the readback form and avoids
+            # treating a cached/unsaved form value as a successful submission.
+            header_price = self._header_order_price(snapshot)
+            if header_price is not None:
+                self._price_evidence["order_readback"] = {
+                    "method": "pending_order_header", "actual_price": header_price,
+                    "actual_shipping": self._header_shipping(snapshot),
+                    "observed_at": datetime.now().astimezone().isoformat(),
+                    **order_binding(snapshot),
+                }
+                return (header_price == str(evidence["approved_price"])
+                        and self._header_shipping(snapshot) == str(evidence["shipping_price"]))
+            return self._verify_price_dialog(snapshot, evidence)
+        page = self._require_page()
+        price = page.locator(selectors.order_price_selector)
+        shipping = page.locator(selectors.order_shipping_price_selector)
+        if price.count() != 1 or shipping.count() != 1:
+            return False
         try:
-            editor.fill(approved_text, timeout=5_000)
-            if editor.input_value().strip() != approved_text:
-                raise ChatAdapterError("消息输入框内容校验失败，未发送。")
-            if not button.is_enabled():
-                raise ChatAdapterError("发送按钮当前不可用，未发送。")
-        except ChatAdapterError:
-            raise
-        except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError) as error:
-            self._record_send_error(page, "输入与按钮状态校验", error)
-            raise TextSendNotPerformedError(
-                f"发送前页面校验失败（{type(error).__name__}），消息未发送，可再次人工确认。"
-            ) from error
+            actual_price = format_money(parse_money(price.inner_text().strip(), field_name="订单价"))
+            actual_shipping = format_money(parse_nonnegative_money(
+                shipping.inner_text().strip(), field_name="订单运费",
+            ))
+            return (actual_price == str(evidence["approved_price"])
+                    and actual_shipping == str(evidence["shipping_price"]))
+        except ValueError:
+            return False
 
+    def _verify_price_dialog(self, snapshot: ConversationSnapshot, evidence: dict[str, object]) -> bool:
+        selectors = self._contract.selectors
+        if not selectors.price_dialog_readback_enabled or current_order_state(snapshot) != "pending_payment":
+            return False
+        page = self._require_ready_page()
+        dialog = page.locator(selectors.price_change_dialog_selector or "")
+        # Refuse a surviving edit form: it could contain unsaved local input.
+        if dialog.count():
+            return False
+        # If the platform header cannot expose an order amount, discard the old
+        # React form state before reading again. This does not submit any action.
+        page.reload(wait_until="domcontentloaded", timeout=8_000)
+        self.open_conversation(snapshot.conversation_key)
+        fresh = self.read_conversation()
+        if not binding_matches(fresh, evidence) or current_order_state(fresh) != "pending_payment":
+            return False
+        button = page.locator(selectors.price_change_button_selector or "")
+        if button.count() != 1:
+            return False
+        matched = False
+        try:
+            button.click(timeout=3_000)
+            page.wait_for_selector(selectors.price_change_dialog_selector or "", state="visible", timeout=5_000)
+            inputs = dialog.locator(selectors.price_change_input_selector or "").all()
+            if dialog.count() != 1 or len(inputs) not in {1, 2}:
+                return False
+            # Reopening an unedited form returns the platform's persisted order
+            # fields, using the same field order as the existing price operation.
+            actual_price = format_money(parse_money(inputs[0].input_value(), field_name="订单回读金额"))
+            actual_shipping = (format_money(parse_nonnegative_money(inputs[1].input_value(), field_name="订单回读运费"))
+                               if len(inputs) == 2 else self._header_shipping(snapshot))
+            self._price_evidence["order_readback"] = {
+                "method": "fresh_page_price_dialog", "actual_price": actual_price,
+                "actual_shipping": actual_shipping,
+                "observed_at": datetime.now().astimezone().isoformat(), **order_binding(fresh),
+            }
+            matched = (actual_price == str(evidence["approved_price"])
+                       and actual_shipping == str(evidence["shipping_price"])
+                       and binding_matches(self.read_conversation(), evidence))
+        finally:
+            # Closing is reversible; neither confirmation button is used here.
+            if dialog.count():
+                close = dialog.locator('button[aria-label="Close"], button.ant-modal-close')
+                if close.count() == 1:
+                    close.click(timeout=3_000)
+                else:
+                    page.keyboard.press("Escape")
+                page.wait_for_selector(selectors.price_change_dialog_selector or "", state="hidden", timeout=3_000)
+        return matched
+
+    @staticmethod
+    def _header_shipping(snapshot: ConversationSnapshot) -> str | None:
+        match = re.search(r"(?:含)?运费\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*元?", snapshot.order_state_text or "")
+        return format_money(parse_nonnegative_money(match[1], field_name="订单运费")) if match else None
+
+    @staticmethod
+    def _header_order_price(snapshot: ConversationSnapshot) -> str | None:
+        text = snapshot.order_state_text or ""
+        from xianyu_assistant.customer_service.contact_policy import order_state_from_text
+
+        if order_state_from_text(text) != "pending_payment" or "活动价" in text:
+            return None
+        # Shipping is a separate amount; only the sole currency-marked product
+        # amount in a platform-confirmed pending-order header can be used here.
+        without_shipping = re.sub(r"(?:含)?运费\s*[¥￥]?\s*\d+(?:\.\d{1,2})?\s*元?", "", text)
+        prices = re.findall(r"[¥￥]\s*(\d+(?:\.\d{1,2})?)(?![\d.])", without_shipping)
+        return format_money(parse_money(prices[0])) if len(prices) == 1 else None
+
+    def can_verify_order_price(self) -> bool:
+        selectors = self._contract.selectors
+        return bool((selectors.order_price_selector and selectors.order_shipping_price_selector)
+                    or selectors.price_dialog_readback_enabled)
+
+    def send_text(self, text: str) -> SendReceipt:
+        """Submit once; a click exception can never prove that nothing was sent."""
+        self._send_evidence = {"stage": "preflight", "click_state": "not_started"}
+        approved_text = text.strip()
+        try:
+            if not approved_text:
+                raise TextSendNotPerformedError("发送文本不能为空。")
+            page = self._require_ready_page()
+            if not self._selected_conversation_key:
+                raise TextSendNotPerformedError("发送前没有唯一选中的会话。")
+            selectors = self._contract.selectors
+            if not selectors.message_input_selector or not selectors.send_button_selector:
+                raise TextSendNotPerformedError("客服页面发送契约尚未配置。")
+            editor = page.locator(selectors.message_input_selector)
+            button = page.locator(selectors.send_button_selector)
+            if editor.count() != 1 or button.count() != 1:
+                raise TextSendNotPerformedError("消息输入框或发送按钮不是唯一节点。")
+            snapshot = self.read_conversation()
+            if snapshot.conversation_key != self._selected_conversation_key:
+                raise TextSendNotPerformedError("发送前活动会话身份不一致。")
+            baseline = {message.message_key for message in snapshot.messages}
+            fingerprint = content_fingerprint(approved_text)
+            self._send_evidence.update({
+                "conversation_key": snapshot.conversation_key,
+                "product_id": snapshot.platform_product_id,
+                "baseline_keys": sorted(baseline),
+                "merchant_account_id": snapshot.merchant_account_id,
+                "platform_customer_id": snapshot.platform_customer_id,
+                "last_customer_key": snapshot.last_incoming_message.message_key
+                    if snapshot.last_incoming_message else None,
+                "submitted_at": datetime.now().astimezone().isoformat(),
+            })
+            self._send_evidence["stage"] = "fill_input"
+            editor.fill(approved_text, timeout=3_000)
+            if editor.input_value(timeout=2_000).strip() != approved_text:
+                raise TextSendNotPerformedError("消息输入框内容校验失败，未发送。", retryable=True)
+            if not button.is_enabled(timeout=2_000):
+                raise TextSendNotPerformedError("发送按钮当前不可用，未发送。", retryable=True)
+            self._send_evidence["stage"] = "final_preflight"
+            final_snapshot = self.read_conversation()
+            from xianyu_assistant.customer_service.contact_policy import order_evidence
+            self._send_evidence["order_observations"] = [item.as_data() for item in order_evidence(final_snapshot)]
+            self._send_evidence["role_uncertain"] = bool(final_snapshot.last_message
+                and final_snapshot.last_message.direction is MessageDirection.UNKNOWN)
+            self._send_evidence["visible_merchant_history"] = any(
+                m.direction is MessageDirection.OUTGOING for m in final_snapshot.messages)
+            from xianyu_assistant.customer_service.contact_policy import looks_like_full_catalog
+            self._send_evidence["visible_catalog"] = any(
+                looks_like_full_catalog(m.text or "") for m in final_snapshot.messages)
+            self._send_evidence["contact_message_evidence"] = [
+                {"message_key": m.message_key, "text": (m.text or "")[:4000],
+                 "direction": m.direction.value, "role_source": m.role_source}
+                for m in final_snapshot.messages[-20:]]
+            if (self._send_evidence["role_uncertain"]
+                    or final_snapshot.platform_customer_id != snapshot.platform_customer_id
+                    or final_snapshot.merchant_account_id != snapshot.merchant_account_id):
+                raise TextSendNotPerformedError("提交前角色无法确认或买卖双方身份变化，未执行提交。")
+            if (final_snapshot.conversation_key != snapshot.conversation_key
+                    or final_snapshot.last_message is None
+                    or snapshot.last_message is None
+                    or final_snapshot.last_message.message_key != snapshot.last_message.message_key):
+                self._send_evidence["stale"] = True
+                raise TextSendNotPerformedError("提交前会话或最新消息变化，旧回复未发送。")
+        except TextSendNotPerformedError:
+            raise
+        except Exception as error:
+            self._record_send_error(self._page, str(self._send_evidence["stage"]), error)
+            raise TextSendNotPerformedError(
+                f"发送前检查失败（{type(error).__name__}），未执行提交。", retryable=True,
+            ) from error
         receipt = SendReceipt(f"pending-{fingerprint[:20]}", fingerprint)
         self._send_baselines[fingerprint] = baseline
+        self._send_evidence["stage"] = "persist_submission"
+        if self._send_checkpoint is not None:
+            self._send_checkpoint(dict(self._send_evidence))
+        self._send_evidence.update(stage="click", click_state="may_have_submitted")
         try:
-            # DOM-native click does not wait for foreground animation frames,
-            # which Chrome throttles while the assistant window covers the tab.
-            # This remains the single irreversible page action: never retry it.
-            clicked = button.evaluate(
-                """element => {
-                    if (!element.isConnected || element.disabled) return false;
-                    element.click();
-                    return true;
-                }"""
-            )
+            clicked = button.evaluate("""element => {
+                if (!element.isConnected || element.disabled) return false;
+                element.click(); return true;
+            }""")
             if clicked is not True:
-                raise RuntimeError("send button was detached or disabled")
+                self._send_evidence["click_state"] = "not_started"
+                raise TextSendNotPerformedError("发送按钮已移除或禁用，未执行提交。", retryable=True)
+            self._send_evidence.update(stage="readback", click_state="click_returned")
             return receipt
-        except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError) as error:
-            # A click exception does not prove that the browser ignored the
-            # action. Read back first so a successful send is never repeated.
-            try:
-                if self.verify_outgoing(receipt):
-                    # The worker performs its own mandatory verification. Keep
-                    # the original baseline so that second check also succeeds.
-                    self._send_baselines[fingerprint] = baseline
-                    return receipt
-            except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError):
-                pass
-            try:
-                text_retained = editor.input_value().strip() == approved_text
-            except (AttributeError, OSError, PlaywrightError, RuntimeError, TypeError, ValueError):
-                text_retained = False
-            self._record_send_error(
-                page,
-                f"实际点击；输入框保留原文={text_retained}",
-                error,
-            )
-            if text_retained:
-                raise TextSendNotPerformedError(
-                    f"发送按钮点击未生效（{type(error).__name__}），已确认消息未出现，"
-                    "草稿可再次人工确认。"
-                ) from error
+        except TextSendNotPerformedError:
+            raise
+        except Exception as error:
+            self._record_send_error(page, "click", error)
             raise ChatAdapterError(
-                f"发送按钮点击异常（{type(error).__name__}），结果无法确认，禁止重试。"
+                f"提交期间异常（{type(error).__name__}），结果需核对，禁止重复点击。"
             ) from error
+
+    def reconcile_send(self, evidence: dict[str, object], fingerprint: str) -> tuple[str, str | None]:
+        """Only inspect the selected conversation; no send or full-history scan."""
+        snapshot = self.read_conversation()
+        if snapshot.conversation_key != evidence.get("conversation_key"):
+            return "uncertain", None
+        if evidence.get("product_id") and snapshot.platform_product_id != evidence["product_id"]:
+            return "uncertain", None
+        if any(evidence.get(field) and getattr(snapshot, field) != evidence[field]
+               for field in ("merchant_account_id", "platform_customer_id")):
+            return "uncertain", None
+        baseline = set(evidence.get("baseline_keys") or [])
+        new_outgoing = [m for m in snapshot.messages
+                        if m.direction is MessageDirection.OUTGOING and m.message_key not in baseline]
+        matched = [m for m in new_outgoing if content_fingerprint(m.text or "") == fingerprint]
+        if not matched:
+            return "uncertain", None
+        # Content alone never attributes a manual message to this application.
+        if evidence.get("click_state") != "click_returned" or len(new_outgoing) != 1 or len(matched) != 1:
+            return "observed_unattributed", None
+        if re.fullmatch(r"[0-9a-f]{64}", matched[0].message_key):
+            return "observed_unattributed", None  # positional fallback is not platform evidence
+        submitted = datetime.fromisoformat(str(evidence["submitted_at"]))
+        if not 0 <= (datetime.now().astimezone() - submitted).total_seconds() <= 90:
+            return "observed_unattributed", None
+        if snapshot.last_incoming_message and snapshot.last_incoming_message.message_key != evidence.get("last_customer_key"):
+            return "observed_unattributed", None
+        # Require the same unique platform row to survive a second, bounded read.
+        page = self._require_page()
+        page.wait_for_timeout(150)
+        second = self.read_conversation()
+        if second.conversation_key != snapshot.conversation_key:
+            return "uncertain", None
+        if any(evidence.get(field) and getattr(second, field) != evidence[field]
+               for field in ("platform_product_id", "merchant_account_id", "platform_customer_id")):
+            return "uncertain", None
+        if evidence.get("product_id") and second.platform_product_id != evidence["product_id"]:
+            return "uncertain", None
+        if any(m.message_key == matched[0].message_key and m.direction is MessageDirection.OUTGOING
+               and content_fingerprint(m.text or "") == fingerprint for m in second.messages):
+            return "verified", matched[0].message_key
+        return "uncertain", None
 
     def send_approved_image(self, path: Path) -> SendReceipt:
         """CS-3 is read-only; media sending begins in CS-6."""
@@ -813,9 +1221,15 @@ class PlaywrightXianyuChatAdapter:
     def change_order_price(self, approved_price: str) -> PriceChangeReceipt:
         """Change the selected order price once through the top-right chat control."""
         exact_price = format_money(parse_money(approved_price, field_name="确认改价"))
+        self._price_evidence = {"stage": "preflight", "click_state": "not_started"}
         page = self._require_ready_page()
         if not self._selected_conversation_key:
             raise ChatAdapterError("改价前没有唯一选中的会话。")
+        before = self.read_conversation()
+        binding = order_binding(before)
+        if (current_order_state(before) != "pending_payment" or price_already_changed(before)
+                or not reliable_order_binding(binding)):
+            raise PriceChangeNotPerformedError("当前订单不是可核对的待付款订单，或已有人改价，未提交。")
         selectors = self._contract.selectors
         required = (
             selectors.price_change_button_selector,
@@ -869,6 +1283,8 @@ class PlaywrightXianyuChatAdapter:
                     != "0.00"
                 ):
                     raise PriceChangeNotPerformedError("运费输入框未能归零，未提交。")
+            elif self._header_shipping(before) != "0.00":
+                raise PriceChangeNotPerformedError("单金额弹窗缺少零运费证据，未提交。")
             if not confirm.is_enabled():
                 raise PriceChangeNotPerformedError("确定修改按钮当前不可用，未提交。")
         except PriceChangeNotPerformedError:
@@ -914,6 +1330,39 @@ class PlaywrightXianyuChatAdapter:
             ) from error
 
         receipt = PriceChangeReceipt(previous_price=previous, applied_price=exact_price)
+        snapshot = self.read_conversation()
+        if (not binding_matches(snapshot, binding) or current_order_state(snapshot) != "pending_payment"
+                or price_already_changed(snapshot)
+                or snapshot.last_incoming_message is None or before.last_incoming_message is None
+                or (snapshot.last_incoming_message.message_key, snapshot.last_incoming_message.text)
+                   != (before.last_incoming_message.message_key, before.last_incoming_message.text)
+                or snapshot.last_message is None or before.last_message is None
+                or (snapshot.last_message.message_key, snapshot.last_message.text)
+                   != (before.last_message.message_key, before.last_message.text)):
+            raise PriceChangeNotPerformedError("最终提交前订单、会话或顾客消息发生变化，未提交。")
+        if format_money(parse_money(price_input.input_value())) != exact_price:
+            raise PriceChangeNotPerformedError("最终提交前金额发生变化，未提交。")
+        if len(price_inputs) == 2 and format_money(parse_nonnegative_money(
+            price_inputs[1].input_value(), field_name="最终运费")) != "0.00":
+            raise PriceChangeNotPerformedError("最终提交前运费发生变化，未提交。")
+        self._price_evidence.update({
+            **binding,
+            "conversation_key": snapshot.conversation_key,
+            "merchant_account_id": snapshot.merchant_account_id,
+            "platform_customer_id": snapshot.platform_customer_id,
+            "product_id": snapshot.platform_product_id,
+            "order_id": snapshot.platform_order_id,
+            "previous_price": previous, "approved_price": exact_price,
+            "shipping_price": "0.00",
+            "last_customer_key": snapshot.last_incoming_message.message_key
+                if snapshot.last_incoming_message else None,
+            "submitted_at": datetime.now().astimezone().isoformat(),
+            "stage": "persist_submission", "click_state": "not_started",
+            "order_price_verifiable": self.can_verify_order_price(),
+        })
+        if self._price_checkpoint is not None:
+            self._price_checkpoint(dict(self._price_evidence))
+        self._price_evidence.update(stage="final_confirm", click_state="may_have_submitted")
         try:
             # This is the one irreversible price action. Never retry this click.
             clicked = final_confirm.evaluate(
@@ -929,6 +1378,7 @@ class PlaywrightXianyuChatAdapter:
             )
             if clicked is not True:
                 raise RuntimeError("final price confirm detached or disabled")
+            self._price_evidence.update(stage="readback", click_state="click_returned")
             page.wait_for_selector(
                 final_confirm_selector,
                 state="hidden",
@@ -963,20 +1413,60 @@ class PlaywrightXianyuChatAdapter:
             return False
         page = self._require_ready_page()
         wait_for_timeout = getattr(page, "wait_for_timeout", None)
-        for _ in range(10):
-            snapshot = self.read_conversation()
-            if any(
-                message.direction is MessageDirection.OUTGOING
-                and message.message_key not in baseline
+        deadline = time.monotonic() + 5.0
+        identity_error = None
+        stable_key = None
+        for _ in range(20):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                snapshot = self.read_conversation()
+            except ConversationIdentityError as error:
+                identity_error = error
+                self._send_evidence["identity_diagnostic"] = dict(error.diagnostic)
+                if callable(wait_for_timeout):
+                    wait_for_timeout(150)
+                continue
+            new_outgoing = [m for m in snapshot.messages if m.direction is MessageDirection.OUTGOING
+                            and m.message_key not in baseline]
+            candidates = [
+                message.message_key
+                for message in new_outgoing
+                if message.key_source in {"platform_attribute", "react_message_id"}
                 and content_fingerprint(message.text or "") == receipt.content_fingerprint
-                for message in snapshot.messages
-            ):
+            ]
+            matched = candidates[0] if len(candidates) == 1 and len(new_outgoing) == 1 else None
+            if not matched:
+                stable_key = None
+            if matched and snapshot.conversation_key == self._selected_conversation_key:
+                if any(self._send_evidence.get(field) and getattr(snapshot, field) != self._send_evidence[field]
+                       for field in ("merchant_account_id", "platform_customer_id")):
+                    return False
+                if stable_key != matched:
+                    stable_key = matched
+                    if callable(wait_for_timeout):
+                        wait_for_timeout(150)
+                    continue
+                if self._selected_conversation_key:
+                    self._verified_outgoing_keys[
+                        (self._selected_conversation_key, receipt.message_key)
+                    ] = str(matched)
                 self._send_baselines.pop(receipt.content_fingerprint, None)
                 return True
             if callable(wait_for_timeout):
                 wait_for_timeout(250)
         self._send_baselines.pop(receipt.content_fingerprint, None)
+        if identity_error is not None:
+            raise identity_error
         return False
+
+    def verified_outgoing_message_key(self, receipt: SendReceipt) -> str | None:
+        """Return the platform row key found during mandatory send readback."""
+        if not self._selected_conversation_key:
+            return None
+        return self._verified_outgoing_keys.pop(
+            (self._selected_conversation_key, receipt.message_key), None
+        )
 
     def _record_send_error(self, page: PageLike, stage: str, error: Exception) -> None:
         detail = str(error).replace("\r", " ").replace("\n", " ")[:450]
@@ -1030,14 +1520,21 @@ class PlaywrightXianyuChatAdapter:
     def _current_conversation_key(self, page: PageLike) -> str:
         selectors = self._contract.selectors
         if selectors.active_conversation_selector:
-            active = page.locator(selectors.active_conversation_selector)
-            if active.count() == 1:
-                actual = self._conversation_key(active, 0)
+            count, actual = self._active_identity(page)
+            if count > 1 or (count == 1 and not actual):
+                raise ConversationIdentityError("活动会话身份不唯一或不可读取。", {
+                    "expected_ref": _identity_ref(self._selected_conversation_key),
+                    "actual_ref": _identity_ref(actual), "active_count": count,
+                })
+            if count == 1:
                 if (
                     self._selected_conversation_key is not None
                     and actual != self._selected_conversation_key
                 ):
-                    raise ChatAdapterError("页面活动会话与目标会话不一致。")
+                    raise ConversationIdentityError("页面活动会话与目标会话不一致。", {
+                        "expected_ref": _identity_ref(self._selected_conversation_key),
+                        "actual_ref": _identity_ref(actual), "active_count": count,
+                    })
                 return actual
         # The virtual list may unmount the active row after a previously
         # verified switch.  Only then may the cached stable session key be
@@ -1109,6 +1606,8 @@ class PlaywrightXianyuChatAdapter:
             listed_price=_string(item_info.get("price")),
             last_message_text=_string(last_message.get("message"))
             or _string(summary.get("summary_content")),
+            platform_customer_id=_string((info or {}).get("buyer_id")),
+            merchant_account_id=_string((info or {}).get("seller_id")),
         )
 
     def _summary_from_row(self, row: dict[str, object], key: str) -> ConversationSummary:
@@ -1132,6 +1631,8 @@ class PlaywrightXianyuChatAdapter:
             listed_price=_string(item_info.get("price")),
             last_message_text=_string(last_message.get("message"))
             or _string(summary.get("summary_content")),
+            platform_customer_id=_string(row.get("buyer_id")),
+            merchant_account_id=_string(row.get("seller_id")),
         )
 
     def _visible_session_rows(self, page: PageLike) -> list[dict[str, object]]:
@@ -1151,6 +1652,8 @@ class PlaywrightXianyuChatAdapter:
                         "item_info": info.get("item_info", {}),
                         "summary": info.get("summary", {}),
                         "last_message": info.get("last_message", {}),
+                        "buyer_id": info.get("buyer_id"),
+                        "seller_id": info.get("seller_id"),
                     }
                 )
             return rows
@@ -1171,6 +1674,8 @@ class PlaywrightXianyuChatAdapter:
                         key: element.getAttribute('data-conversation-key') ||
                             (session?.sessionId ? `session-${session.sessionId}` : null),
                         title: session?.title ?? null,
+                        buyer_id: session?.buyerId ?? session?.buyerUserId ?? session?.buyerInfo?.userId ?? session?.buyer?.userId ?? null,
+                        seller_id: session?.sellerId ?? session?.sellerUserId ?? session?.sellerInfo?.userId ?? session?.seller?.userId ?? null,
                         text: element.innerText || '',
                         unread: Boolean(session?.unread) || Boolean(element.querySelector('.ant-badge-count')),
                         changed_at: element.getAttribute('data-changed-at'),
@@ -1210,6 +1715,8 @@ class PlaywrightXianyuChatAdapter:
                     const lastMessage = session.lastMessage || {};
                     return {
                         session_id: session.sessionId ?? null,
+                        buyer_id: session.buyerId ?? session.buyerUserId ?? session.buyerInfo?.userId ?? session.buyer?.userId ?? null,
+                        seller_id: session.sellerId ?? session.sellerUserId ?? session.sellerInfo?.userId ?? session.seller?.userId ?? null,
                         title: session.title ?? null,
                         item_info: {
                             item_id: itemInfo.itemId ?? null,
@@ -1249,6 +1756,19 @@ class PlaywrightXianyuChatAdapter:
                 return item
         raise ChatAdapterError("未找到指定消息。")
 
+    def _media_signature_from_item(self, item: LocatorLike, kind: MessageKind) -> str | None:
+        if kind not in {MessageKind.IMAGE, MessageKind.VOICE} or not hasattr(item, "evaluate"):
+            return None
+        selector = (self._contract.selectors.image_kind_selector if kind is MessageKind.IMAGE
+                    else "audio, source")
+        if not selector:
+            return None
+        source = item.evaluate("""(element, selector) => {
+            const media=element.querySelector(selector);
+            return media && (media.currentSrc || media.getAttribute('src') || media.getAttribute('data-src'));
+        }""", selector)
+        return _media_signature(kind, source)
+
     def _message_key(
         self,
         item: LocatorLike,
@@ -1271,8 +1791,7 @@ class PlaywrightXianyuChatAdapter:
                             const candidates = [props, props.message, props.messageInfo, props.data];
                             for (const value of candidates) {
                                 if (!value || typeof value !== 'object') continue;
-                                const id = value.messageId ?? value.msgId ?? value.message_id ??
-                                    value.uuid ?? value.id;
+                                const id = value.messageId ?? value.msgId ?? value.message_id;
                                 if (id !== undefined && id !== null && String(id).length > 0) {
                                     return String(id);
                                 }
@@ -1287,8 +1806,16 @@ class PlaywrightXianyuChatAdapter:
                 pass
         timestamp = item.get_attribute(self._contract.selectors.platform_time_attribute) or ""
         return hashlib.sha256(
-            f"{index}:{direction.value}:{kind.value}:{timestamp}:{text}".encode()
+            f"{direction.value}:{kind.value}:{timestamp}:{text}".encode()
         ).hexdigest()
+
+
+def _media_signature(kind: MessageKind, source: object) -> str | None:
+    if kind not in {MessageKind.IMAGE, MessageKind.VOICE} or not isinstance(source, str) or not source:
+        return None
+    # Preserve all URL components in the hash. Changing signed URLs may miss a
+    # cache, which is safer than attributing different media to one cached result.
+    return hashlib.sha256(f"{kind.value}:{source}".encode()).hexdigest()
 
 
 def _item_text(item: LocatorLike, selector: str | None) -> str:
@@ -1299,41 +1826,22 @@ def _item_text(item: LocatorLike, selector: str | None) -> str:
     return item.inner_text().strip()
 
 
+def _read_role(item: LocatorLike, selectors: ChatPageSelectors,
+               merchant_id: str | None = None, buyer_id: str | None = None) -> tuple[MessageDirection, str, str]:
+    raw: dict[str, object] = {"raw_direction": item.get_attribute(selectors.direction_attribute)}
+    if hasattr(item, "evaluate"):
+        result = item.evaluate("(e,s)=>{" + ROLE_READER_JS + "return readRole(e,s);}", {
+            name: getattr(selectors, name) for name in (
+                "direction_attribute", "incoming_direction_selector", "outgoing_direction_selector", "text_selector",
+            )
+        })
+        if isinstance(result, dict):
+            raw.update(result)
+    return resolve_role(raw, merchant_id=merchant_id, buyer_id=buyer_id)
+
+
 def _direction(item: LocatorLike, selectors: ChatPageSelectors) -> MessageDirection:
-    value = item.get_attribute(selectors.direction_attribute)
-    if value is None:
-        # The live page places the avatar before the content for incoming
-        # rows and after it for outgoing rows.  Geometry is more reliable
-        # than :scope selectors here because the page uses nested wrappers.
-        if hasattr(item, "evaluate"):
-            try:
-                placement = item.evaluate(
-                    """element => {
-                        const content = element.querySelector('.message-content--kBUbolyy');
-                        const avatar = element.querySelector('img.avatar--e05bt3Ju');
-                        if (!content || !avatar) return null;
-                        const contentRect = content.getBoundingClientRect();
-                        const avatarRect = avatar.getBoundingClientRect();
-                        return {contentX: contentRect.x, avatarX: avatarRect.x};
-                    }"""
-                )
-                if isinstance(placement, dict):
-                    content_x = float(placement["contentX"])
-                    avatar_x = float(placement["avatarX"])
-                    if avatar_x < content_x:
-                        return MessageDirection.INCOMING
-                    if avatar_x > content_x:
-                        return MessageDirection.OUTGOING
-            except (KeyError, TypeError, ValueError):
-                pass
-        if selectors.incoming_direction_selector and item.locator(selectors.incoming_direction_selector).count() > 0:
-            return MessageDirection.INCOMING
-        if selectors.outgoing_direction_selector and item.locator(selectors.outgoing_direction_selector).count() > 0:
-            return MessageDirection.OUTGOING
-    try:
-        return MessageDirection((value or "").casefold())
-    except ValueError as error:
-        raise ChatAdapterError("消息方向不在已知枚举中。") from error
+    return _read_role(item, selectors)[0]
 
 
 def _kind(item: LocatorLike, selectors: ChatPageSelectors) -> MessageKind:
@@ -1385,6 +1893,10 @@ def _number(value: object, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _identity_ref(value: object) -> str | None:
+    return hashlib.sha256(str(value).encode()).hexdigest()[:12] if value else None
 
 
 def _fallback_conversation_key(row: dict[str, object], index: int) -> str:

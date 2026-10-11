@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from typing import Protocol
 
+from xianyu_assistant.customer_service.fact_guard import product_facts
 from xianyu_assistant.customer_service.models import HistoricalExample, ProductKnowledge
+from xianyu_assistant.customer_service.price_change import format_money, parse_money
+from xianyu_assistant.customer_service.product_facts import BATTERY_CHEMISTRY_LINE
 
 
 class CatalogRepository(Protocol):
@@ -15,6 +19,8 @@ class CatalogRepository(Protocol):
     def archive_products_except(self, current_product_keys: tuple[str, ...]) -> int: ...
 
     def save_product_knowledge(self, product: ProductKnowledge) -> None: ...
+
+    def list_product_knowledge(self, *, include_disabled: bool = True) -> list[ProductKnowledge]: ...
 
     def save_curated_example(self, example: HistoricalExample) -> None: ...
 
@@ -43,7 +49,7 @@ CURRENT_OPERATING_POLICY = {
     "bluetooth_upgrade": "蓝牙模块由顾客选装，选装时在商品价格基础上增加20元",
     "charger": "默认赠送充电器",
     "capacity_video": "可提供发货前容量测试视频，顾客咨询时转人工处理",
-    "warranty": "所有电池质保一年，容量虚标包退",
+    "warranty": "所有电池质保三年，容量虚标包退",
     "first_use": "电池到货后先充满电，再装车使用",
     "charging_duration": "正常充电约5-6小时",
 }
@@ -56,15 +62,17 @@ CURRENT_PRODUCTS = (
         listed_price="678.00",
         minimum_price="650.00",
         specifications=(
+            BATTERY_CHEMISTRY_LINE + "\n"
             "型号：60V30Ah（6030）\n"
-            "尺寸：17-18-32\n"
+            "尺寸：17-18-32cm\n"
             "实测容量：29Ah左右\n"
             "健康度：97%以上\n"
+            "循环次数：约100次\n"
             "二轮原装车单人平路续航预估：50-60公里左右"
         ),
         inventory_notes="当前在售",
         shipping_notes="默认包邮；新疆、内蒙古、西藏不包邮；海南不发货；广东普宁发货；默认发安能物流和京东。",
-        after_sales_notes="所有电池质保一年，容量虚标包退。",
+        after_sales_notes="所有电池质保三年，容量虚标包退。",
         supplementary_knowledge=(
             "原装25年铁塔。续航为二轮原装车、单人、平路条件下的预估。"
             "蓝牙模块由顾客选装，选装时在商品价格基础上增加20元。"
@@ -79,15 +87,17 @@ CURRENT_PRODUCTS = (
         listed_price="398.00",
         minimum_price="378.00",
         specifications=(
+            BATTERY_CHEMISTRY_LINE + "\n"
             "型号：60V20Ah（6020）\n"
-            "尺寸：14.5-17-29\n"
+            "尺寸：14.5-17-29cm\n"
             "实测容量：19Ah左右\n"
             "健康度：97%以上\n"
+            "循环次数：约100次\n"
             "二轮原装车单人平路续航预估：40公里左右"
         ),
         inventory_notes="当前在售",
         shipping_notes="默认包邮；新疆、内蒙古、西藏不包邮；海南不发货；广东普宁发货；默认发安能物流和京东。",
-        after_sales_notes="所有电池质保一年，容量虚标包退。",
+        after_sales_notes="所有电池质保三年，容量虚标包退。",
         supplementary_knowledge=(
             "原装25年铁塔。续航为二轮原装车、单人、平路条件下的预估。"
             "蓝牙模块由顾客选装，选装时在商品价格基础上增加20元。"
@@ -102,15 +112,17 @@ CURRENT_PRODUCTS = (
         listed_price="518.00",
         minimum_price="480.00",
         specifications=(
+            BATTERY_CHEMISTRY_LINE + "\n"
             "型号：48V30Ah（4830）\n"
-            "尺寸：15-17.5-30\n"
+            "尺寸：15-17.5-30cm\n"
             "实测容量：29Ah左右\n"
             "健康度：97%以上\n"
+            "循环次数：约100次\n"
             "二轮原装车单人平路续航预估：50公里左右"
         ),
         inventory_notes="当前在售",
         shipping_notes="默认包邮；新疆、内蒙古、西藏不包邮；海南不发货；广东普宁发货；默认发安能物流和京东。",
-        after_sales_notes="所有电池质保一年，容量虚标包退。",
+        after_sales_notes="所有电池质保三年，容量虚标包退。",
         supplementary_knowledge=(
             "原装25年铁塔。续航为二轮原装车、单人、平路条件下的预估。"
             "蓝牙模块由顾客选装，选装时在商品价格基础上增加20元。"
@@ -121,21 +133,125 @@ CURRENT_PRODUCTS = (
 )
 
 FIRST_CONTACT_CATALOG_REPLY = """原装25年铁塔
-60V30A 678元 尺寸17-18-32
-容量29安左右 健康度97以上
+60V30A 678元 尺寸17-18-32cm
+容量29安左右 健康度97%以上
 二轮原装车单人平路续航预估50-60公里左右
-60V20A 398元 尺寸14.5-17-29
-容量19安左右 健康度97以上
+60V20A 398元 尺寸14.5-17-29cm
+容量19安左右 健康度97%以上
 二轮原装车单人平路续航预估40公里左右
-48V30A 518元 尺寸15-17.5-30
-容量29安左右 健康度97以上
+48V30A 518元 尺寸15-17.5-30cm
+容量29安左右 健康度97%以上
 二轮原装车单人平路续航预估50公里左右
 蓝牙模块可选装 加20元"""
 
 CURRENT_CATALOG_REPLY = FIRST_CONTACT_CATALOG_REPLY + """
 默认送充电器
 默认包邮 新疆内蒙古西藏除外 海南不发货
-所有电池质保一年 容量虚标包退"""
+所有电池质保三年 容量虚标包退"""
+
+
+def configured_catalog_reply(repository: CatalogRepository, *, include_business: bool = False) -> str:
+    """Render catalog prices from the saved product settings, never stale constants."""
+    list_products = getattr(repository, "list_product_knowledge", None)
+    if not callable(list_products):
+        return CURRENT_CATALOG_REPLY if include_business else FIRST_CONTACT_CATALOG_REPLY
+    configured = {
+        product.product_key: product
+        for product in list_products(include_disabled=False)
+        if product.enabled
+    }
+    rendered = []
+    order = {product.product_key: index for index, product in enumerate(CURRENT_PRODUCTS)}
+    for product in sorted(configured.values(), key=lambda item: (order.get(item.product_key, len(order)), item.name)):
+        if not product.listed_price:
+            continue
+        facts = product_facts(product)
+        if facts.conflicts:
+            continue
+        try:
+            price = format_money(parse_money(product.listed_price, field_name="商品标价"))
+        except ValueError:
+            continue
+        display = price[:-3] if price.endswith(".00") else price.rstrip("0").rstrip(".")
+        rendered.append(f"{product.name} {display}元")
+        for key in ("chemistry", "dimensions", "capacity", "health", "range"):
+            fact = facts.values.get(key)
+            if fact is not None and (key != "dimensions" or fact.unit):
+                rendered.append(fact.evidence)
+        if include_business:
+            for text in (product.shipping_notes, product.after_sales_notes):
+                if text:
+                    rendered.append(text)
+    if not rendered:
+        return "当前商品资料我确认下"
+    common_bluetooth = {line.strip() for product in configured.values()
+                        for line in product.supplementary_knowledge.split("。") if "蓝牙" in line}
+    if len(common_bluetooth) == 1 and all("蓝牙" in product.supplementary_knowledge for product in configured.values()):
+        rendered.extend(common_bluetooth)
+    return "\n".join(rendered)
+
+
+
+def catalog_message_prices_match(repository: CatalogRepository, message: str) -> bool:
+    """Reject fixed wording with a currency amount absent from current settings."""
+    money = re.compile(r"[¥￥]\s*(\d+(?:\.\d+)?)|(?<!\d)(\d+(?:\.\d+)?)\s*(?:元|块(?:钱)?)")
+    allowed = {
+        parse_money(match.group(1) or match.group(2))
+        for match in money.finditer(configured_catalog_reply(repository))
+    }
+    list_products = getattr(repository, "list_product_knowledge", None)
+    products = list_products(include_disabled=False) if callable(list_products) else []
+    for line in message.splitlines():
+        line_prices = [parse_money(match.group(1) or match.group(2)) for match in money.finditer(line)]
+        if not all(price in allowed for price in line_prices):
+            return False
+        mentioned = [
+            product for product in products
+            if product.enabled and any(
+                len(alias) >= 3
+                and re.search(rf"(?<!\d){re.escape(alias.casefold())}(?!\d)", line.casefold())
+                for alias in product.aliases
+            )
+        ]
+        if len(mentioned) == 1 and line_prices:
+            product = mentioned[0]
+            try:
+                expected = parse_money(product.listed_price or "", field_name="商品标价")
+            except ValueError:
+                return False
+            if any(price != expected and not (price == parse_money(BLUETOOTH_UPGRADE_AMOUNT) and "蓝牙" in line) for price in line_prices):
+                return False
+    return True
+
+
+def configured_multi_model_price_reply(repository: CatalogRepository, query: str) -> str | None:
+    """Quote each explicitly named model from its own saved product row."""
+    list_products = getattr(repository, "list_product_knowledge", None)
+    if not callable(list_products):
+        return None
+    matches: list[tuple[int, str]] = []
+    folded = query.casefold()
+    for product in list_products(include_disabled=False):
+        if not product.enabled or not product.listed_price:
+            continue
+        positions = [
+            match.start()
+            for alias in product.aliases
+            if len(alias) >= 3
+            for match in [re.search(rf"(?<!\d){re.escape(alias.casefold())}(?!\d)", folded)]
+            if match is not None
+        ]
+        if not positions:
+            continue
+        try:
+            price = format_money(parse_money(product.listed_price, field_name="商品标价"))
+        except ValueError:
+            return None
+        display = price[:-3] if price.endswith(".00") else price.rstrip("0").rstrip(".")
+        matches.append((min(positions), f"{product.name} {display}元"))
+    if len(matches) < 2:
+        return None
+    return "，".join(reply for _, reply in sorted(matches))
 
 CURRENT_QA_EXAMPLES = (
     HistoricalExample(
@@ -147,19 +263,19 @@ CURRENT_QA_EXAMPLES = (
     HistoricalExample(
         "current-tieta-6030-20260913",
         "6030 60V30A多少钱 尺寸多大 容量健康度和续航",
-        "60V30A 678元 尺寸17-18-32 容量29安左右 健康度97以上 二轮原装车单人平路续航预估50-60公里左右",
+        "60V30A 678元 尺寸17-18-32cm 容量29安左右 健康度97%以上 二轮原装车单人平路续航预估50-60公里左右",
         "user_curated",
     ),
     HistoricalExample(
         "current-tieta-6020-20260913",
         "6020 60V20A多少钱 尺寸多大 容量健康度和续航",
-        "60V20A 398元 尺寸14.5-17-29 容量19安左右 健康度97以上 二轮原装车单人平路续航预估40公里左右",
+        "60V20A 398元 尺寸14.5-17-29cm 容量19安左右 健康度97%以上 二轮原装车单人平路续航预估40公里左右",
         "user_curated",
     ),
     HistoricalExample(
         "current-tieta-4830-20260913",
         "4830 48V30A多少钱 尺寸多大 容量健康度和续航",
-        "48V30A 518元 尺寸15-17.5-30 容量29安左右 健康度97以上 二轮原装车单人平路续航预估50公里左右",
+        "48V30A 518元 尺寸15-17.5-30cm 容量29安左右 健康度97%以上 二轮原装车单人平路续航预估50公里左右",
         "user_curated",
     ),
     HistoricalExample(
@@ -189,7 +305,7 @@ CURRENT_QA_EXAMPLES = (
     HistoricalExample(
         "current-business-sales-policy-20260919",
         "送充电器吗 包邮吗 哪些地区不发 质保多久 容量虚标怎么办",
-        "默认送充电器 默认包邮 新疆内蒙古西藏不包邮 海南不发货 所有电池质保一年 容量虚标包退",
+        "默认送充电器 默认包邮 新疆内蒙古西藏不包邮 海南不发货 所有电池质保三年 容量虚标包退",
         "user_curated",
     ),
     HistoricalExample(
@@ -211,10 +327,19 @@ def install_current_catalog(repository: CatalogRepository) -> bool:
         tuple(example.example_id for example in CURRENT_QA_EXAMPLES)
     )
     if repository.get_setting("current_product_catalog_version") == CATALOG_VERSION:
+        _backfill_battery_chemistry(repository)
         return False
     for product in CURRENT_PRODUCTS:
         repository.save_product_knowledge(product)
     for example in CURRENT_QA_EXAMPLES:
         repository.save_curated_example(example)
     repository.set_setting("current_product_catalog_version", CATALOG_VERSION)
+    _backfill_battery_chemistry(repository)
     return True
+
+
+def _backfill_battery_chemistry(repository: CatalogRepository) -> None:
+    """Apply an independent additive migration without resetting catalog edits."""
+    migrate = getattr(repository, "backfill_current_battery_chemistry", None)
+    if callable(migrate):
+        migrate()

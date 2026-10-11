@@ -1,5 +1,5 @@
 #define AppName "闲鱼铺货助手"
-#define AppVersion "0.1.4"
+#define AppVersion "0.1.13"
 #define AppPublisher "Xianyu Assistant Team"
 #define AppExeName "XianyuAssistant.exe"
 
@@ -32,9 +32,10 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "..\dist\XianyuAssistant\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; The database contains business data and non-secret settings. It is seeded only
-; on a clean install and is deliberately retained on upgrade and uninstall.
-Source: "..\build\installer-assets\xianyu_assistant.db"; DestDir: "{localappdata}\XianyuAssistant"; Flags: ignoreversion onlyifdoesntexist uninsneveruninstall
+; The app imports these files into the actual launching user's profile on first run.
+; Existing user data is never replaced, and Windows credentials are not included.
+Source: "..\build\installer-assets\xianyu_assistant.db"; DestDir: "{app}\seed-data"; Flags: ignoreversion
+Source: "..\build\installer-assets\images\*"; DestDir: "{app}\seed-data\images"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\build\installer-assets\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
 Source: "..\build\installer-assets\googlechromestandaloneenterprise64.msi"; DestDir: "{tmp}"; Flags: deleteafterinstall
 
@@ -45,7 +46,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "
 [Run]
 Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; StatusMsg: "正在补齐 Microsoft Visual C++ 运行库…"; Flags: runhidden waituntilterminated; Check: not VCRuntimeAvailable
 Filename: "{sys}\msiexec.exe"; Parameters: "/i ""{tmp}\googlechromestandaloneenterprise64.msi"" /qn /norestart"; StatusMsg: "未检测到 Chrome 或 Edge，正在安装 Chrome…"; Flags: runhidden waituntilterminated; Check: not SupportedBrowserAvailable
-Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Description: "启动 {#AppName}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 function SupportedBrowserAvailable: Boolean;

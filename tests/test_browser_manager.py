@@ -52,6 +52,20 @@ class FakeBrowser:
 
     def __init__(self) -> None:
         self.contexts = [FakeContext()]
+        self.connected = True
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+
+def test_connection_status_detects_dropped_cdp_transport() -> None:
+    manager = BrowserManager(BrowserConnectionConfig())
+    browser = FakeBrowser()
+    manager._browser = browser
+    manager._context = browser.contexts[0]
+    assert manager.is_connected is True
+    browser.connected = False
+    assert manager.is_connected is False
 
 
 class FakeChromium:

@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
+from pathlib import Path
 
-from PyQt6.QtCore import QSignalBlocker, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QLockFile, QSignalBlocker, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -29,11 +33,19 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from xianyu_assistant.browser.manager import BrowserConnectionConfig, BrowserManager
+from xianyu_assistant.browser.executor_protocol import BrowserExecutorError
+from xianyu_assistant.browser.executor_supervisor import (
+    OPERATION_TIMEOUTS,
+    BrowserExecutorSupervisor,
+)
+from xianyu_assistant.browser.manager import (
+    BrowserConnectionConfig,
+    BrowserConnectionError,
+)
 from xianyu_assistant.customer_service.browser_adapter import (
     REAL_XIANYU_CHAT_CONTRACT,
-    PlaywrightXianyuChatAdapter,
 )
+from xianyu_assistant.customer_service.browser_adapter_proxy import BrowserAdapterProxy
 from xianyu_assistant.customer_service.customer_service_worker import (
     CustomerServiceWorker,
     CustomerServiceWorkerError,
@@ -42,6 +54,7 @@ from xianyu_assistant.customer_service.customer_service_worker import (
 from xianyu_assistant.customer_service.deepseek_client import DeepSeekClient
 from xianyu_assistant.customer_service.models import (
     CustomerServiceConfig,
+    PageHealthStatus,
     PriceChangeDraft,
     PriceChangeStatus,
     ReceptionMode,
@@ -50,14 +63,41 @@ from xianyu_assistant.customer_service.models import (
     ReplyJobStatus,
 )
 from xianyu_assistant.customer_service.price_change import PricePolicyError, check_price_change
+from xianyu_assistant.customer_service.quality_export import export_quality_bundle
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 from xianyu_assistant.security.credential_store import CredentialStore, KeyringCredentialStore
 
 logger = logging.getLogger(__name__)
 
 
+class QualityExportThread(QThread):
+    """Create a consistent quality bundle without blocking the Qt interface."""
+
+    completed = pyqtSignal(object, str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, database_path: Path, output_path: Path, days: int, raw: bool,
+                 parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._database_path = database_path
+        self._output_path = output_path
+        self._days = days
+        self._raw = raw
+
+    def run(self) -> None:
+        try:
+            counts = export_quality_bundle(
+                self._database_path, self._output_path,
+                days=self._days, include_raw_text=self._raw,
+            )
+            self.completed.emit(counts, str(self._output_path))
+        except Exception as error:
+            logger.exception("客服质检包导出失败。")
+            self.failed.emit(str(error)[:240] or error.__class__.__name__)
+
+
 class CustomerServiceRunThread(QThread):
-    """Own the synchronous Playwright and customer-service worker resources."""
+    """Own the guarded worker and its terminable browser executor."""
 
     status_changed = pyqtSignal(str)
     drafts_changed = pyqtSignal()
@@ -71,7 +111,7 @@ class CustomerServiceRunThread(QThread):
         browser_config: BrowserConnectionConfig,
         *,
         mode: ReceptionMode = ReceptionMode.HUMAN_CONFIRMATION,
-        checkout_guidance_enabled: bool = False,
+        checkout_guidance_enabled: bool = True,
         credential_store: CredentialStore | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -84,35 +124,78 @@ class CustomerServiceRunThread(QThread):
         self._engine: CustomerServiceWorker | None = None
         self._engine_lock = threading.RLock()
         self._stop_requested = threading.Event()
+        self._last_progress_monotonic = time.monotonic()
+        self._stall_reported = False
+        self._run_id: int | None = None
+        self._supervisor: BrowserExecutorSupervisor | None = None
+        self._diagnostic_queue: queue.SimpleQueue[tuple[str, int]] = queue.SimpleQueue()
+        self._operation_starts: dict[str, datetime] = {}
+        self.executor_exit_confirmed = True
 
     def run(self) -> None:
         """Attach, health-check, and poll until the UI asks the run to stop."""
-        manager = BrowserManager(self._browser_config)
+        manager = BrowserExecutorSupervisor(self._browser_config, stop_event=self._stop_requested)
+        self._supervisor = manager
         run_id: int | None = None
         final_status = ReceptionStatus.HALTED.value
         final_reason: str | None = None
         failure_category: str | None = None
         exception_type: str | None = None
+        reception_lock = QLockFile(str(self._repository.database_path.parent / "reception.lock"))
+        reception_lock.setStaleLockTime(0)
+        owns_lock = False
         try:
+            owns_lock = reception_lock.tryLock(0)
+            if not owns_lock:
+                self.run_error.emit("已有客服接待实例占用本机发送通道，请关闭另一实例后再启动。")
+                return
+            self._repository.recover_abandoned_runs(now=datetime.now().astimezone())
             run_id = self._repository.start_run_session(
                 mode=self._mode.value,
                 started_at=datetime.now().astimezone(),
             )
-            manager.connect()
+            self._run_id = run_id
+            manager.set_operation_recorder(self._record_browser_operation)
+            run_config = CustomerServiceConfig(
+                mode=self._mode, checkout_guidance_enabled=self._checkout_guidance_enabled,
+            )
+            save_config = getattr(self._repository, "save_run_runtime_config", None)
+            if callable(save_config):
+                save_config(run_id, settings={
+                    "customer_service": {**asdict(run_config), "mode": run_config.mode.value},
+                    "browser_operation_deadlines_seconds": OPERATION_TIMEOUTS,
+                    "browser_cdp_port": self._browser_config.port,
+                    "image_cache": {"ttl_seconds": 600, "max_bytes": 32 * 1024 * 1024,
+                                    "max_items": 100},
+                    "transcript_retention_days": 15,
+                    "model_http": {"transport": "httpx_async", "inactivity_timeout_seconds": 20,
+                                   "total_timeout_seconds": 45, "max_attempts": 2,
+                                   "failure_cooldown_seconds": 60},
+                    "sqlite_busy_timeout_seconds": self._repository.busy_timeout_seconds,
+                }, recorded_at=datetime.now().astimezone())
+            self._repository.record_quality_event(
+                run_id=run_id, conversation_key=None, event_type="run_started",
+                detail=self._mode.value, created_at=datetime.now().astimezone(),
+            )
+            connected = self._connect_initial(manager)
+            if not connected:
+                final_status = ReceptionStatus.STOPPED.value
+                final_reason = "用户停止"
+                self.status_changed.emit(final_status)
+                return
             settings = _deepseek_settings(self._repository)
             credential_store = self._credential_store or KeyringCredentialStore()
             model = DeepSeekClient(settings, credential_store)
-            adapter = PlaywrightXianyuChatAdapter(manager, REAL_XIANYU_CHAT_CONTRACT)
+            adapter = BrowserAdapterProxy(manager, REAL_XIANYU_CHAT_CONTRACT)
             engine = CustomerServiceWorker(
                 adapter,
                 self._repository,
                 model,
-                config=CustomerServiceConfig(
-                    mode=self._mode,
-                    checkout_guidance_enabled=self._checkout_guidance_enabled,
-                ),
+                config=run_config,
                 text_model=settings.text_model,
                 vision_model=settings.vision_model,
+                async_model_calls=True,
+                run_id=run_id,
             )
             with self._engine_lock:
                 self._engine = engine
@@ -124,9 +207,111 @@ class CustomerServiceRunThread(QThread):
                 failure_category = "page_health"
                 self.run_error.emit(final_reason)
                 return
+            last_heartbeat = 0.0
             while not self._stop_requested.is_set() and engine.status is ReceptionStatus.RUNNING:
                 engine.run_once()
+                self._record_pending_diagnostics()
+                self._last_progress_monotonic = time.monotonic()
+                self._stall_reported = False
+                if time.monotonic() - last_heartbeat >= 10:
+                    self._repository.touch_run_session(run_id, now=datetime.now().astimezone())
+                    last_heartbeat = time.monotonic()
                 self.drafts_changed.emit()
+                if engine.browser_recovery_needed or adapter.infrastructure_failure:
+                    self._repository.record_quality_event(
+                        run_id=run_id, conversation_key=None, event_type="capture_gap_started",
+                        detail="浏览器连接或客服页不可用", created_at=datetime.now().astimezone(),
+                    )
+                    self.status_changed.emit("reconnecting")
+                    recovered = False
+                    recovery_started = time.monotonic()
+                    cause = adapter.infrastructure_failure
+                    recovery_reason = _safe_error_message(cause) if cause else "浏览器连接或客服页不可用"
+                    recovery_code = type(cause).__name__ if cause else "browser_unavailable"
+                    recovery_attempt = 0
+                    old_epoch = manager.epoch
+                    old_pid = manager.progress_snapshot().get("pid")
+                    old_actor_exit_confirmed: bool | None = None
+                    for attempt, delay in enumerate((2, 5, 10, 20, 30)):
+                        if self._stop_requested.is_set():
+                            break
+                        if self._stop_requested.wait(delay):
+                            break
+                        if time.monotonic() - recovery_started > 150:
+                            break
+                        recovery_attempt = attempt + 1
+                        old_epoch = manager.epoch
+                        old_pid = manager.progress_snapshot().get("pid")
+                        old_actor_exit_confirmed = None
+                        self._record_browser_recovery(
+                            manager, state="attempt", failure_code=recovery_code,
+                            reason=recovery_reason, attempt=recovery_attempt,
+                            started=recovery_started, old_epoch=old_epoch, old_pid=old_pid,
+                            old_actor_exit_confirmed=old_actor_exit_confirmed,
+                        )
+                        try:
+                            manager.recover()
+                            # recover() returns only after the old actor's exit
+                            # has been confirmed; the new actor is then alive.
+                            old_actor_exit_confirmed = True
+                            adapter.reset_after_disconnect()
+                            adapter.open_dedicated_chat_page()
+                            health = adapter.check_page_health()
+                            if health.status is PageHealthStatus.HEALTHY:
+                                engine.browser_recovered()
+                                self._repository.record_quality_event(
+                                    run_id=run_id, conversation_key=None,
+                                    event_type="capture_gap_ended",
+                                    detail=f"第 {attempt + 1} 次重连成功",
+                                    created_at=datetime.now().astimezone(),
+                                )
+                                self.status_changed.emit(ReceptionStatus.RUNNING.value)
+                                self._record_browser_recovery(
+                                    manager, state="success", failure_code=recovery_code,
+                                    reason="客服页恢复并通过健康检查", attempt=recovery_attempt,
+                                    started=recovery_started, old_epoch=old_epoch, old_pid=old_pid,
+                                    old_actor_exit_confirmed=old_actor_exit_confirmed,
+                                )
+                                recovered = True
+                                break
+                            if health.status in {
+                                PageHealthStatus.LOGIN_REQUIRED,
+                                PageHealthStatus.CAPTCHA,
+                                PageHealthStatus.RISK_CONTROL,
+                            }:
+                                engine.halt_for_page_health(health.status)
+                                break
+                            recovery_reason = health.detail or health.status.value
+                            self._record_browser_recovery(
+                                manager, state="attempt_failed",
+                                failure_code=f"page_{health.status.value}",
+                                reason=recovery_reason, attempt=recovery_attempt,
+                                started=recovery_started, old_epoch=old_epoch, old_pid=old_pid,
+                                old_actor_exit_confirmed=old_actor_exit_confirmed,
+                            )
+                        except Exception as error:
+                            recovery_reason = _safe_error_message(error)
+                            if "退出未确认" in recovery_reason:
+                                old_actor_exit_confirmed = False
+                            logger.exception("客服浏览器恢复尝试失败。")
+                            self._record_browser_recovery(
+                                manager, state="attempt_failed", failure_code=type(error).__name__,
+                                reason=recovery_reason, attempt=recovery_attempt,
+                                started=recovery_started, old_epoch=old_epoch, old_pid=old_pid,
+                                old_actor_exit_confirmed=old_actor_exit_confirmed,
+                            )
+                    if not recovered:
+                        self._record_browser_recovery(
+                            manager, state="cancelled" if self._stop_requested.is_set() else "final_failure",
+                            failure_code=recovery_code,
+                            reason="用户停止恢复" if self._stop_requested.is_set() else engine.stop_reason or recovery_reason,
+                            attempt=recovery_attempt, started=recovery_started,
+                            old_epoch=old_epoch, old_pid=old_pid,
+                            old_actor_exit_confirmed=old_actor_exit_confirmed,
+                        )
+                    if not recovered and engine.status is ReceptionStatus.RUNNING and not self._stop_requested.is_set():
+                        engine.halt_for_browser_failure()
+                        break
                 self._stop_requested.wait(CustomerServiceConfig().poll_interval_seconds)
             if engine.status is ReceptionStatus.RUNNING:
                 engine.stop("用户停止")
@@ -144,8 +329,34 @@ class CustomerServiceRunThread(QThread):
             self.status_changed.emit(ReceptionStatus.HALTED.value)
             self.run_error.emit(final_reason)
         finally:
+            self._record_pending_diagnostics()
+            if "engine" in locals() and callable(getattr(engine, "close", None)):
+                try:
+                    engine.close()
+                except Exception:
+                    logger.exception("客服模型资源关闭失败。")
+            try:
+                manager.disconnect()
+            except (BrowserConnectionError, BrowserExecutorError) as error:
+                self.executor_exit_confirmed = False
+                final_status = ReceptionStatus.HALTED.value
+                final_reason = "浏览器执行者退出未确认，请先关闭程序并检查后台进程。"
+                failure_category = "executor_cleanup"
+                exception_type = type(error).__name__
+                logger.exception("客服浏览器执行者关闭失败。")
+                self.status_changed.emit(final_status)
+                self.run_error.emit(final_reason)
+            finally:
+                self._supervisor = None
+                if owns_lock:
+                    reception_lock.unlock()
             if run_id is not None:
                 try:
+                    self._repository.record_quality_event(
+                        run_id=run_id, conversation_key=None, event_type="run_finished",
+                        detail=f"{final_status}: {final_reason or ''}",
+                        created_at=datetime.now().astimezone(),
+                    )
                     self._repository.finish_run_session(
                         run_id,
                         status=final_status,
@@ -159,11 +370,103 @@ class CustomerServiceRunThread(QThread):
                     logger.exception("客服运行停止原因保存失败。")
             with self._engine_lock:
                 self._engine = None
-            manager.disconnect()
+
+    def _connect_initial(self, manager: BrowserExecutorSupervisor) -> bool:
+        started = time.monotonic()
+        last_error: Exception | None = None
+        for delay in (0, 2, 5, 10, 20, 30):
+            if self._stop_requested.wait(delay):
+                return False
+            if time.monotonic() - started > 150:
+                break
+            try:
+                manager.connect()
+                return True
+            except (BrowserConnectionError, BrowserExecutorError) as error:
+                last_error = error
+                self.status_changed.emit("reconnecting")
+                logger.warning("调试浏览器尚未连接，正在有限重试。")
+        raise BrowserConnectionError("本机调试浏览器连接失败，请启动浏览器并检查 CDP 端口。") from last_error
+
+    def record_stall(self, phase: str, elapsed: int) -> None:
+        """Record a UI observation without a database wait on the Qt thread."""
+        if self._stall_reported:
+            return
+        self._stall_reported = True
+        detail = f"运行阶段 {phase} 已持续 {elapsed} 秒。"
+        logger.error("CS_WORKER_STALL %s", detail)
+        self._diagnostic_queue.put((phase, elapsed))
+
+    def _record_pending_diagnostics(self) -> None:
+        while True:
+            try:
+                phase, elapsed = self._diagnostic_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._repository.record_quality_event(
+                    run_id=self._run_id, conversation_key=None, event_type="worker_stall",
+                    detail=f"运行阶段 {phase} 已持续 {elapsed} 秒。",
+                    created_at=datetime.now().astimezone(),
+                )
+            except Exception:  # noqa: BLE001 - diagnostic persistence never takes over sending
+                logger.error("工作线程停滞记录无法保存。")
+
+    def _record_browser_operation(self, event: dict[str, object]) -> None:
+        recorder = getattr(self._repository, "record_browser_operation", None)
+        if not callable(recorder):
+            return
+        now = datetime.now().astimezone()
+        request_id = str(event.get("request_id") or "")
+        outcome = str(event.get("event") or event.get("outcome") or "unknown")
+        starting = outcome in {"start", "operation_start", "started"}
+        if starting:
+            self._operation_starts[request_id] = now
+        started_at = self._operation_starts.get(request_id, now)
+        recorder(
+            request_id=request_id, run_id=self._run_id,
+            epoch=int(event.get("epoch") or 0),
+            operation=str(event.get("operation") or "unknown"),
+            started_at=started_at, completed_at=None if starting else now,
+            deadline_seconds=float(event.get("deadline_seconds") or 0), outcome=outcome,
+            conversation_key=event.get("conversation_key"),
+            action_id=event.get("action_id"), diagnostic=event,
+        )
+        if not starting:
+            self._operation_starts.pop(request_id, None)
+
+    def browser_progress_snapshot(self) -> dict[str, object] | None:
+        supervisor = self._supervisor
+        return None if supervisor is None else supervisor.progress_snapshot()
+
+    def _record_browser_recovery(
+        self, manager: BrowserExecutorSupervisor, *, state: str, failure_code: str,
+        reason: str, attempt: int, started: float, old_epoch: int,
+        old_pid: object, old_actor_exit_confirmed: bool | None,
+    ) -> None:
+        recorder = getattr(self._repository, "record_runtime_recovery", None)
+        if not callable(recorder):
+            return
+        recorder(
+            failure_code=failure_code, recovery_state=state, run_id=self._run_id,
+            epoch=manager.epoch, created_at=datetime.now().astimezone(),
+            diagnostic={
+                "reason": reason, "attempt": attempt,
+                "elapsed_seconds": max(0.0, time.monotonic() - started),
+                "old_epoch": old_epoch, "old_pid": old_pid,
+                "old_actor_exit_confirmed": old_actor_exit_confirmed,
+                "executor": manager.progress_snapshot(),
+            },
+        )
 
     def request_stop(self) -> None:
         """Interrupt the poll wait and ask the engine to stop safely."""
+        if self._stop_requested.is_set():
+            return
         self._stop_requested.set()
+        supervisor = self._supervisor
+        if supervisor is not None:
+            supervisor.request_stop()
         with self._engine_lock:
             engine = self._engine
         if engine is not None:
@@ -173,7 +476,9 @@ class CustomerServiceRunThread(QThread):
         """Return the thread-safe in-memory draft view for the Qt table."""
         with self._engine_lock:
             engine = self._engine
-        return [] if engine is None else engine.drafts.list()
+        if engine is None:
+            return []
+        return engine.drafts.recent(keep=200)
 
     def progress_snapshot(self) -> ReceptionProgress | None:
         with self._engine_lock:
@@ -249,8 +554,16 @@ class CustomerServicePanel(QWidget):
         self._browser_config_provider = browser_config_provider
         self._credential_store = credential_store
         self._run_thread: CustomerServiceRunThread | None = None
+        self._quality_export_thread: QualityExportThread | None = None
         self._selected_job_id: str | None = None
         self._selected_price_task_id: str | None = None
+        self._close_requested = False
+        self._draft_render_signature: tuple[object, ...] | None = None
+        self._last_run_message = "已停止"
+        self._last_run_code = ReceptionStatus.STOPPED.value
+        self._last_run_error = False
+        self._activity_status_message: str | None = None
+        self._executor_shutdown_failed = False
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(1_000)
         self._refresh_timer.timeout.connect(self.refresh_drafts)
@@ -285,11 +598,6 @@ class CustomerServicePanel(QWidget):
         self.mode_combo.setToolTip(
             "默认人工审核；全自动模式会发送回复，并对通过全部规则的待付款订单直接改价。"
         )
-        self.checkout_guidance_checkbox = QCheckBox("试用下单引导")
-        self.checkout_guidance_checkbox.setChecked(False)
-        self.checkout_guidance_checkbox.setToolTip(
-            "本次运行启用克制的下单引导；默认关闭。人工模式可先审核草稿，全自动模式会直接发送。"
-        )
         self.status_label = QLabel("已停止")
         self.status_label.setObjectName("receptionStatus")
         self.status_label.setProperty("tone", "neutral")
@@ -310,7 +618,6 @@ class CustomerServicePanel(QWidget):
         controls.setSpacing(8)
         controls.addWidget(QLabel("运行模式"))
         controls.addWidget(self.mode_combo, 1)
-        controls.addWidget(self.checkout_guidance_checkbox)
         controls.addSpacing(8)
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
@@ -322,6 +629,25 @@ class CustomerServicePanel(QWidget):
         control_layout.addLayout(controls)
         control_layout.addLayout(status_row)
         control_layout.addWidget(self.activity_label)
+        self.operation_notice = QLabel("")
+        self.operation_notice.setObjectName("mutedText")
+        self.operation_notice.setWordWrap(True)
+        control_layout.addWidget(self.operation_notice)
+        export_row = QHBoxLayout()
+        export_row.addWidget(QLabel("质检记录"))
+        self.quality_range_combo = QComboBox()
+        for days in (7, 30, 90):
+            self.quality_range_combo.addItem(f"最近 {days} 天", days)
+        self.quality_range_combo.setCurrentIndex(1)
+        self.quality_raw_checkbox = QCheckBox("包含未脱敏原文")
+        self.quality_raw_checkbox.setToolTip("默认会隐去手机号、地址等个人信息，保留型号与报价。")
+        self.quality_export_button = QPushButton("导出对话质检包 ZIP")
+        self.quality_export_button.setObjectName("primaryAction")
+        export_row.addWidget(self.quality_range_combo)
+        export_row.addWidget(self.quality_raw_checkbox)
+        export_row.addWidget(self.quality_export_button)
+        export_row.addStretch()
+        control_layout.addLayout(export_row)
 
         self.price_change_group = QGroupBox("订单改价 · 审核与记录")
         self.price_change_group.setObjectName("priceChangeCard")
@@ -550,6 +876,7 @@ class CustomerServicePanel(QWidget):
         layout.addWidget(self.workspace_splitter, 1)
 
         self.start_button.clicked.connect(self.start_reception)
+        self.quality_export_button.clicked.connect(self.export_quality_records)
         self.stop_button.clicked.connect(self.stop_reception)
         self.handoff_table.itemSelectionChanged.connect(self._handoff_selected)
         self.resolve_handoff_button.clicked.connect(self.resolve_selected_handoff)
@@ -585,6 +912,9 @@ class CustomerServicePanel(QWidget):
 
     def start_reception(self) -> None:
         """Start the selected mode, confirming every fully automatic run."""
+        if self._executor_shutdown_failed:
+            self._set_run_status("旧浏览器执行者退出未确认，暂时不能启动新接待。", error=True)
+            return
         if self._run_thread is not None and self._run_thread.isRunning():
             return
         mode = ReceptionMode(self.mode_combo.currentData())
@@ -596,12 +926,9 @@ class CustomerServicePanel(QWidget):
                 "请确认商品标价、最低成交价和议价规则均已核对。\n\n"
                 "改价前会重新读取会话并校验型号、最终成交价、价格区间和最新消息；"
                 "无法确认或页面操作失败时不会重试，只会将该顾客转人工，其他顾客继续处理。"
-                + (
-                    "\n\n本次同时试用下单引导：有明确购买意向时可能追加一句引导，"
-                    "符合条件时可能在顾客沉默后追问一次。"
-                    if self.checkout_guidance_checkbox.isChecked()
-                    else ""
-                ),
+                "\n\n下单引导默认启用：议价成功或顾客明确想买时，"
+                "可能提示先拍下并取消付款、待改价后再付；"
+                "符合条件时可能在顾客沉默后追问一次。",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                 QMessageBox.StandardButton.Cancel,
             )
@@ -617,13 +944,12 @@ class CustomerServicePanel(QWidget):
             self.repository,
             config,
             mode=mode,
-            checkout_guidance_enabled=self.checkout_guidance_checkbox.isChecked(),
             credential_store=self._credential_store,
             parent=self,
         )
         thread.status_changed.connect(self._run_status_changed)
         thread.drafts_changed.connect(self.refresh_drafts)
-        thread.run_error.connect(lambda message: self._set_status(message, error=True))
+        thread.run_error.connect(lambda message: self._set_run_status(message, error=True))
         thread.approval_finished.connect(self._approval_finished)
         price_signal = getattr(thread, "price_change_finished", None)
         if price_signal is not None:
@@ -633,13 +959,9 @@ class CustomerServicePanel(QWidget):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.mode_combo.setEnabled(False)
-        self.checkout_guidance_checkbox.setEnabled(False)
-        self._set_status(
-            (
-                "正在启动全自动客服（试用下单引导）…"
-                if self.checkout_guidance_checkbox.isChecked()
-                else "正在启动全自动客服…"
-            )
+        self._last_run_code = ReceptionStatus.STARTING.value
+        self._set_run_status(
+            "正在启动全自动客服…"
             if mode is ReceptionMode.AUTO_SEND
             else "正在启动客服页…"
         )
@@ -650,9 +972,56 @@ class CustomerServicePanel(QWidget):
         """Stop the background run without closing the user's browser."""
         if self._run_thread is None:
             return
-        self._set_status("正在停止客服接待…")
+        self._last_run_code = ReceptionStatus.STOPPING.value
+        self._set_run_status("正在停止客服接待…")
         self.stop_button.setEnabled(False)
         self._run_thread.request_stop()
+
+    def export_quality_records(self) -> None:
+        """Save a read-only snapshot that can be sent from another computer."""
+        if self._quality_export_thread is not None and self._quality_export_thread.isRunning():
+            return
+        raw = self.quality_raw_checkbox.isChecked()
+        if raw:
+            choice = QMessageBox.warning(
+                self, "确认导出原文",
+                "原文包可能包含顾客姓名、电话和地址。请确认接收方和传输方式。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if choice is not QMessageBox.StandardButton.Yes:
+                return
+        suggested = f"客服对话质检包-{datetime.now().astimezone():%Y%m%d-%H%M%S}.zip"
+        selected, _filter = QFileDialog.getSaveFileName(
+            self, "导出对话质检包", str(Path.home() / "Downloads" / suggested),
+            "ZIP 压缩包 (*.zip)",
+        )
+        if not selected:
+            return
+        output = Path(selected)
+        if output.suffix.lower() != ".zip":
+            output = output.with_suffix(".zip")
+        thread = QualityExportThread(
+            self.repository.database_path, output,
+            int(self.quality_range_combo.currentData()), raw, parent=self,
+        )
+        thread.completed.connect(self._quality_export_completed)
+        thread.failed.connect(lambda message: self._set_status(f"质检包导出失败：{message}", error=True))
+        thread.finished.connect(self._quality_export_finished)
+        self._quality_export_thread = thread
+        self.quality_export_button.setEnabled(False)
+        self._set_status("正在生成对话质检包…")
+        thread.start()
+
+    def _quality_export_completed(self, counts: dict[str, int], path: str) -> None:
+        self._set_status(
+            f"质检包已保存：{path}（消息 {counts['messages']} 条，应用发送记录 {counts['sends']} 条）。"
+        )
+
+    def _quality_export_finished(self) -> None:
+        self.quality_export_button.setEnabled(True)
+        self._quality_export_thread = None
+        self._resume_requested_close()
 
     def refresh_drafts(self) -> None:
         """Refresh only the local draft table; no browser operation is performed."""
@@ -662,7 +1031,12 @@ class CustomerServicePanel(QWidget):
         if self._run_thread is None:
             return
         drafts = self._run_thread.drafts_snapshot()
-        self.draft_group.setTitle(f"回复草稿与状态 · {len(drafts)}")
+        self.draft_group.setTitle(f"回复草稿与状态 · {len(drafts)}（活动任务与最近200条历史）")
+        signature = tuple((d.job_id, d.status, d.reply_text, d.failure_reason) for d in drafts)
+        if signature == self._draft_render_signature:
+            self._update_edit_state()
+            return
+        self._draft_render_signature = signature
         selected = self._selected_job_id
         blocker = QSignalBlocker(self.draft_table)
         self.draft_table.setRowCount(0)
@@ -699,8 +1073,12 @@ class CustomerServicePanel(QWidget):
         if not callable(reader):
             return
         progress = reader()
+        browser_reader = getattr(thread, "browser_progress_snapshot", None)
+        browser_progress = browser_reader() if callable(browser_reader) else None
         if progress is None:
-            self.activity_label.setText("轮询：正在启动")
+            operation = _browser_operation_label(str((browser_progress or {}).get("operation") or "connect"))
+            elapsed = int(float((browser_progress or {}).get("elapsed_seconds") or 0))
+            self.activity_label.setText(f"轮询：正在启动 · {operation} {elapsed} 秒")
             return
         phase_labels = {
             "idle": "等待下一轮",
@@ -713,7 +1091,10 @@ class CustomerServicePanel(QWidget):
             "policy_check": "检查回复策略",
             "sending": "发送并确认消息",
             "sales_follow_ups": "检查销售追问",
+            "reconnecting": "恢复浏览器连接",
             "halted": "已安全暂停",
+            "send_recheck": "核对待确认发送",
+            "diagnosing_send_channel": "检查发送通道",
         }
         phase = phase_labels.get(progress.phase, progress.phase)
         elapsed = (
@@ -721,7 +1102,30 @@ class CustomerServicePanel(QWidget):
             if progress.phase_started_at is not None
             else 0
         )
-        warning = " · 处理时间偏长，请检查日志" if progress.phase not in {"idle", "halted"} and elapsed >= 180 else ""
+        browser_progress = browser_progress or {}
+        operation = str(browser_progress.get("operation") or "")
+        operation_elapsed = float(browser_progress.get("elapsed_seconds") or 0)
+        operation_deadline = float(browser_progress.get("deadline_seconds") or 0)
+        browser_state = str(browser_progress.get("state") or "")
+        operation_stalled = bool(operation and operation_deadline
+                                 and operation_elapsed > operation_deadline + 2)
+        stalled = (progress.phase not in {"idle", "halted", "reconnecting"}
+                   and elapsed >= 60) or operation_stalled
+        warning = " · 操作超时，正在检查恢复" if stalled else ""
+        recovering = browser_state in {"recovering", "terminating", "timed_out", "timeout"}
+        model_waiting = int(getattr(progress, "model_waiting_count", 0))
+        model_paused = bool(getattr(progress, "model_paused", False))
+        model_pause_reason = str(getattr(progress, "model_pause_reason", None) or "")
+        self._activity_status_message = (
+            "操作停滞，正在检查恢复…" if stalled else
+            "正在恢复浏览器连接…" if recovering else
+            "模型不可用，继续采集" if model_paused
+            and self._last_run_code == ReceptionStatus.RUNNING.value else None
+        )
+        self._render_run_status()
+        if stalled and callable(getattr(thread, "record_stall", None)):
+            thread.record_stall(operation or progress.phase,
+                                int(operation_elapsed) if operation_stalled else elapsed)
         healthy_age = (
             max(0, int((datetime.now().astimezone() - progress.last_healthy_at).total_seconds()))
             if progress.last_healthy_at is not None
@@ -732,11 +1136,16 @@ class CustomerServicePanel(QWidget):
             "persisted_handoff": "已转人工",
             "already_processed": "已处理",
             "existing_job": "已有任务",
+            "context_read_retry_wait": "等待读取重试",
+            "failed_task_requires_review": "失败任务需核对",
             "restored_draft": "等待审核",
             "no_new_customer_message": "无新消息",
+            "role_uncertain": "消息角色待核对",
+            "catalog_quote_without_question": "目录引用无新问题",
             "conversation_read_error": "读取失败",
             "post_fulfillment": "已发货",
             "unstable_conversation_id": "会话标识不稳定",
+            "scan_budget": "扫描预算用尽",
         }
         skip_detail = "、".join(
             f"{skip_labels.get(reason, reason)} {count}"
@@ -752,8 +1161,13 @@ class CustomerServicePanel(QWidget):
             )
             + (f" · 上次页面正常 {healthy_age} 秒前" if healthy_age is not None else "")
             + (f" · 跳过：{skip_detail}" if skip_detail else "")
+            + (f" · 模型等待 {model_waiting}" if model_waiting else "")
+            + (" · 模型不可用，继续采集" if model_paused else "")
+            + (f" · {_browser_operation_label(operation)} {int(operation_elapsed)}/{int(operation_deadline)} 秒"
+               if operation else "")
             + warning
         )
+        self.activity_label.setToolTip(model_pause_reason if model_paused else "")
 
     def refresh_price_changes(self) -> None:
         """Refresh persisted price proposals without touching the browser."""
@@ -850,10 +1264,11 @@ class CustomerServicePanel(QWidget):
         warning = (
             "即将修改真实订单价格\n\n"
             f"商品：{task.product_name}\n"
-            f"顾客报价：¥{task.customer_offer or '未记录'}\n"
+            f"确认成交价：¥{task.customer_offer or '未记录'}\n"
             f"最低成交价：¥{task.minimum_price or '未设置'}\n"
             f"最终改价：¥{task.proposed_price}\n\n"
-            "确认后，程序会打开聊天页右上角的“修改价格”，填写金额并单击“确定修改”。"
+            "确认后，程序会核对当前待付款订单，打开右上角“修改价格”，填写金额和零运费，"
+            "依次确认，随后回读订单金额。结果不确定时不会重复提交。"
         )
         choice = QMessageBox.warning(
             self,
@@ -953,7 +1368,7 @@ class CustomerServicePanel(QWidget):
         self.handoff_group.setTitle(f"转人工通知 · {count}")
         self.handoff_hint.setText(
             f"程序内提醒 · 待处理 {count} 条（含持续人工锁）\n"
-            "已发货会话关闭提醒后仍保持人工；其他顾客照常接待。"
+            "发送待确认会话先核对；已发货会话关闭提醒后仍保持人工。"
         )
         self._handoff_selected()
 
@@ -1032,11 +1447,28 @@ class CustomerServicePanel(QWidget):
         self._set_status("正在执行发送前重读与页面发送…")
 
     def closeEvent(self, event: object) -> None:
-        """Stop the owned worker before the panel is destroyed."""
-        self.stop_reception()
-        if self._run_thread is not None and self._run_thread.isRunning():
-            self._run_thread.wait(3_000)
+        """Keep the panel alive until all its owned threads have finished."""
+        if not self.request_safe_close():
+            event.ignore()  # type: ignore[attr-defined]
+            return
         super().closeEvent(event)  # type: ignore[arg-type]
+
+    def request_safe_close(self) -> bool:
+        """Request a stop and tell the containing window whether it can close."""
+        running = self._run_thread is not None and self._run_thread.isRunning()
+        exporting = self._quality_export_thread is not None and self._quality_export_thread.isRunning()
+        if not running and not exporting:
+            return True
+        self._close_requested = True
+        self.start_button.setEnabled(False)
+        if running:
+            self.stop_reception()
+        self._set_status("正在完成停止与记录保存，结束后关闭。")
+        return False
+
+    def _resume_requested_close(self) -> None:
+        if self._close_requested and self.request_safe_close():
+            QTimer.singleShot(0, self.close)
 
     def _draft_selected(self) -> None:
         row = self.draft_table.currentRow()
@@ -1155,22 +1587,30 @@ class CustomerServicePanel(QWidget):
             self.selected_hint.setText("请选择一条待审核草稿。")
 
     def _run_status_changed(self, status: str) -> None:
+        self._last_run_code = status
         labels = {
             ReceptionStatus.STARTING.value: "正在启动客服页…",
             ReceptionStatus.RUNNING.value: "运行中",
+            "reconnecting": "正在连接或恢复调试浏览器…",
             ReceptionStatus.STOPPING.value: "正在停止…",
             ReceptionStatus.STOPPED.value: "已停止",
-            ReceptionStatus.HALTED.value: "已暂停（需检查配置或页面状态）",
+            ReceptionStatus.HALTED.value: "已暂停（具体原因见状态与质检包）",
         }
-        self._set_status(labels.get(status, status), error=status == ReceptionStatus.HALTED.value)
+        if status in {ReceptionStatus.HALTED.value, ReceptionStatus.STOPPED.value}:
+            self._activity_status_message = None
+        self._set_run_status(labels.get(status, status), error=status == ReceptionStatus.HALTED.value)
 
     def _run_finished(self) -> None:
         self._refresh_timer.stop()
-        self.start_button.setEnabled(True)
+        thread = self._run_thread
+        self._executor_shutdown_failed = not getattr(thread, "executor_exit_confirmed", True)
+        self.start_button.setEnabled(not self._close_requested and not self._executor_shutdown_failed)
         self.stop_button.setEnabled(False)
         self.mode_combo.setEnabled(True)
-        self.checkout_guidance_checkbox.setEnabled(True)
         self._run_thread = None
+        self._activity_status_message = None
+        self._render_run_status()
+        self._resume_requested_close()
 
     def _approval_finished(self, job_id: str, sent: bool, message: str) -> None:
         """Render the worker's verified send outcome on the UI thread."""
@@ -1188,8 +1628,25 @@ class CustomerServicePanel(QWidget):
         self._set_status(message, error=not applied)
 
     def _set_status(self, message: str, *, error: bool = False) -> None:
+        """Show action results separately from the persistent run state."""
+        self.operation_notice.setText(message)
+        self.operation_notice.setProperty("tone", "error" if error else "neutral")
+        self.operation_notice.style().unpolish(self.operation_notice)
+        self.operation_notice.style().polish(self.operation_notice)
+
+    def _set_run_status(self, message: str, *, error: bool = False) -> None:
+        self._last_run_message = message
+        self._last_run_error = error
+        self._render_run_status()
+
+    def _render_run_status(self) -> None:
+        message = self._activity_status_message or self._last_run_message
+        error = self._last_run_error or bool(self._activity_status_message)
+        tone = "error" if error else "success"
+        if self.status_label.text() == message and self.status_label.property("tone") == tone:
+            return
         self.status_label.setText(message)
-        self.status_label.setProperty("tone", "error" if error else "success")
+        self.status_label.setProperty("tone", tone)
         self.status_label.style().unpolish(self.status_label)
         self.status_label.style().polish(self.status_label)
         self.status_changed.emit(message)
@@ -1206,6 +1663,28 @@ def _deepseek_settings(repository: CustomerServiceRepository):
         vision_model=repository.get_setting("deepseek_vision_model", "deepseek-chat")
         or "deepseek-chat",
     )
+
+
+def _browser_operation_label(operation: str) -> str:
+    return {
+        "start_executor": "建立浏览器连接",
+        "connect": "连接浏览器",
+        "configure_contract": "准备客服页",
+        "open_dedicated_chat_page": "打开客服页",
+        "check_page_health": "检查客服页",
+        "list_changed_conversations": "扫描新消息",
+        "open_conversation": "打开顾客会话",
+        "read_conversation": "读取顾客消息",
+        "request_voice_transcript": "读取顾客语音",
+        "capture_incoming_image": "读取顾客图片",
+        "send_text": "发送并确认回复",
+        "verify_outgoing": "核对已发消息",
+        "reconcile_send": "核对待确认发送",
+        "change_order_price": "修改并确认订单价格",
+        "verify_order_price": "回读实际订单金额和运费",
+        "close_owned_targets": "关闭应用客服页",
+        "close": "结束浏览器连接",
+    }.get(operation, "浏览器操作")
 
 
 def _conversation_label(conversation_key: str) -> str:

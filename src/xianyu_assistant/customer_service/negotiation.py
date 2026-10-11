@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
+from xianyu_assistant.customer_service.battery_models import model_matches
+from xianyu_assistant.customer_service.fingerprints import normalize_for_matching
 from xianyu_assistant.customer_service.models import ProductKnowledge, ReplyProposal
 from xianyu_assistant.customer_service.price_change import format_money, parse_money
 from xianyu_assistant.customer_service.semantic_analysis import CustomerSemantics
@@ -181,9 +183,18 @@ def _parse_chinese_quantity(value: str) -> int | None:
     return None
 
 
+def _without_model_tokens(text: str) -> str:
+    folded = normalize_for_matching(text)
+    for model in reversed(model_matches(folded)):
+        folded = folded[:model.start()] + " " * len(model[0]) + folded[model.end():]
+    return folded
+
+
 def quantity_from_messages(current_query: str, prior_customer_texts: tuple[str, ...]) -> int:
     for text in (current_query, *reversed(prior_customer_texts)):
-        match = _QUANTITY_RE.search(text)
+        # A model ending in digits must not obscure an adjacent Chinese
+        # quantity (60V30两组). Keep every remaining number's original meaning.
+        match = _QUANTITY_RE.search(_without_model_tokens(text))
         if match is None:
             continue
         quantity = _parse_chinese_quantity(match.group(1))
@@ -196,7 +207,7 @@ def _offer_from_query(query: str, *, allow_contextual_bare: bool = False) -> Dec
     explicit = list(_MONEY_UNIT_RE.finditer(query))
     if explicit:
         return Decimal(explicit[-1].group(1) or explicit[-1].group(2))
-    cleaned = _MODEL_NUMBER_RE.sub(" ", query)
+    cleaned = _MODEL_NUMBER_RE.sub(" ", _without_model_tokens(query))
     cleaned = _VOLTAGE_CAPACITY_RE.sub(" ", cleaned)
     cleaned = _DIMENSION_RE.sub(" ", cleaned)
     cleaned = _YEAR_OR_HEALTH_RE.sub(" ", cleaned)
@@ -240,7 +251,11 @@ def build_negotiation_plan(
 ) -> NegotiationPlan | None:
     if knowledge is None or not knowledge.listed_price or not knowledge.minimum_price:
         return None
-    same_previous = previous if previous and previous.product_key == knowledge.product_key else None
+    same_previous = (
+        previous
+        if previous and previous.product_key == knowledge.product_key and previous.quantity == quantity
+        else None
+    )
     offer = (
         Decimal(semantics.money_offer)
         if semantics is not None and semantics.is_negotiation and semantics.money_offer
@@ -278,6 +293,19 @@ def build_negotiation_plan(
     listed_total = listed * quantity_decimal
     minimum_total = minimum * quantity_decimal
     opening_total = max(minimum_total, min(listed_total, opening * quantity_decimal))
+    if same_previous is not None:
+        # Product settings may have changed since this conversation last negotiated.
+        try:
+            negotiated = [
+                parse_money(value, field_name="历史议价")
+                for value in (same_previous.last_counter, same_previous.accepted_price)
+                if value is not None
+            ]
+        except ValueError:
+            same_previous = None
+        else:
+            if any(price < minimum_total or price > listed_total for price in negotiated):
+                same_previous = None
 
     if offer is None and asks_quantity_price:
         listed_total_text = _plain_money(listed_total)

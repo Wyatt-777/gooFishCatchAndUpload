@@ -33,17 +33,29 @@ from xianyu_assistant.customer_service.browser_adapter import (
     REAL_XIANYU_CHAT_CONTRACT,
     PlaywrightXianyuChatAdapter,
 )
+from xianyu_assistant.customer_service.business_replies import (
+    BUSINESS_REPLIES,
+    BUSINESS_REPLY_SETTING_PREFIX,
+    configured_business_reply,
+    validate_business_reply,
+)
 from xianyu_assistant.customer_service.current_catalog import (
-    FIRST_CONTACT_CATALOG_REPLY,
     FIRST_CONTACT_MESSAGE_SETTING,
     MAX_FIRST_CONTACT_MESSAGE_LENGTH,
     MAX_PRICE_SILENCE_FOLLOW_UP_LENGTH,
     PRICE_SILENCE_FOLLOW_UP_SETTING,
+    catalog_message_prices_match,
+    configured_catalog_reply,
     install_current_catalog,
 )
 from xianyu_assistant.customer_service.deepseek_client import (
     DeepSeekClient,
     DeepSeekClientError,
+)
+from xianyu_assistant.customer_service.fact_guard import (
+    FactGuardError,
+    product_facts,
+    validate_fixed_message,
 )
 from xianyu_assistant.customer_service.history_sync import (
     CustomerServiceHistorySynchronizer,
@@ -56,6 +68,7 @@ from xianyu_assistant.customer_service.knowledge_importer import (
 )
 from xianyu_assistant.customer_service.media_assets import MediaAssetError, register_media_asset
 from xianyu_assistant.customer_service.models import DeepSeekSettings, ProductKnowledge
+from xianyu_assistant.customer_service.price_change import format_money, parse_money
 from xianyu_assistant.persistence.customer_service_repository import CustomerServiceRepository
 from xianyu_assistant.security.credential_store import (
     CredentialStore,
@@ -158,9 +171,9 @@ class CustomerServiceSettingsPanel(QWidget):
         self.first_contact_message_input.setPlainText(
             repository.get_setting(
                 FIRST_CONTACT_MESSAGE_SETTING,
-                FIRST_CONTACT_CATALOG_REPLY,
+                configured_catalog_reply(repository),
             )
-            or FIRST_CONTACT_CATALOG_REPLY
+            or configured_catalog_reply(repository)
         )
         self.first_contact_message_input.setPlaceholderText("请输入首次对话时发送的话术")
         self.first_contact_message_input.setMinimumHeight(210)
@@ -175,11 +188,12 @@ class CustomerServiceSettingsPanel(QWidget):
         first_contact_group.setObjectName("firstContactCard")
         first_contact_layout = QVBoxLayout(first_contact_group)
         first_contact_hint = QLabel(
-            "仅在与顾客真正首次对话时发送一次；保存后立即对新的首次会话生效，"
-            "不会重新发送给已经接待过的顾客。"
+            "真正首次对话时发送；顾客距上一轮消息满15分钟后提出新问题，会再次发送。"
+            "15分钟内追问正常回答；已有订单、人工接管或发送待核对时不重复发送。"
         )
         first_contact_hint.setWordWrap(True)
         first_contact_hint.setObjectName("mutedText")
+        first_contact_hint.setMinimumHeight(64)
         first_contact_layout.addWidget(first_contact_hint)
         first_contact_layout.addWidget(self.first_contact_message_input)
         first_contact_layout.addLayout(first_contact_buttons)
@@ -191,7 +205,7 @@ class CustomerServiceSettingsPanel(QWidget):
         self.price_silence_follow_up_input.setPlaceholderText(
             "例如：刚才咨询的电池还需要了解什么吗？需要的话我可以继续帮您确认。"
         )
-        self.price_silence_follow_up_input.setMinimumHeight(110)
+        self.price_silence_follow_up_input.setMinimumHeight(210)
         self.save_price_silence_follow_up_button = QPushButton("保存未下单追问话术")
         self.save_price_silence_follow_up_button.setObjectName("primaryAction")
         self.clear_price_silence_follow_up_button = QPushButton("停用并清空话术")
@@ -208,9 +222,36 @@ class CustomerServiceSettingsPanel(QWidget):
         )
         price_follow_up_hint.setWordWrap(True)
         price_follow_up_hint.setObjectName("mutedText")
+        price_follow_up_hint.setMinimumHeight(64)
         price_follow_up_layout.addWidget(price_follow_up_hint)
         price_follow_up_layout.addWidget(self.price_silence_follow_up_input)
         price_follow_up_layout.addLayout(price_follow_up_buttons)
+
+        business_group = QGroupBox("常见业务回复话术")
+        business_group.setObjectName("businessRepliesCard")
+        business_layout = QVBoxLayout(business_group)
+        business_hint = QLabel(
+            "仅修改已确认业务信息的表达方式。触发条件、价格、售后和特殊地区发货规则仍由程序校验。"
+        )
+        business_hint.setWordWrap(True)
+        business_hint.setObjectName("mutedText")
+        business_layout.addWidget(business_hint)
+        self.business_reply_inputs: dict[str, QLineEdit] = {}
+        business_form = QFormLayout()
+        for reply in BUSINESS_REPLIES:
+            field = QLineEdit(configured_business_reply(repository, reply.key))
+            field.setMaxLength(100)
+            self.business_reply_inputs[reply.key] = field
+            business_form.addRow(reply.label + "：", field)
+        business_layout.addLayout(business_form)
+        business_buttons = QHBoxLayout()
+        self.save_business_replies_button = QPushButton("保存业务话术")
+        self.save_business_replies_button.setObjectName("primaryAction")
+        self.reset_business_replies_button = QPushButton("恢复默认业务话术")
+        business_buttons.addWidget(self.save_business_replies_button)
+        business_buttons.addWidget(self.reset_business_replies_button)
+        business_buttons.addStretch()
+        business_layout.addLayout(business_buttons)
 
         self.product_table = QTableWidget(0, 6)
         self.product_table.setHorizontalHeaderLabels(("商品 Key", "名称", "平台 ID", "标价", "最低价", "状态"))
@@ -316,8 +357,12 @@ class CustomerServiceSettingsPanel(QWidget):
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addWidget(api_group)
-        layout.addWidget(first_contact_group)
-        layout.addWidget(price_follow_up_group)
+        message_cards = QHBoxLayout()
+        message_cards.setSpacing(12)
+        message_cards.addWidget(first_contact_group, 1)
+        message_cards.addWidget(price_follow_up_group, 1)
+        layout.addLayout(message_cards)
+        layout.addWidget(business_group)
         layout.addWidget(product_group)
         layout.addWidget(media_group)
         layout.addWidget(import_group)
@@ -339,6 +384,8 @@ class CustomerServiceSettingsPanel(QWidget):
         self.clear_price_silence_follow_up_button.clicked.connect(
             self.clear_price_silence_follow_up
         )
+        self.save_business_replies_button.clicked.connect(self.save_business_replies)
+        self.reset_business_replies_button.clicked.connect(self.reset_business_replies)
         self.add_product_button.clicked.connect(self.add_product)
         self.sync_chat_button.clicked.connect(self.sync_live_chats)
         self.edit_product_button.clicked.connect(self.edit_product)
@@ -352,6 +399,13 @@ class CustomerServiceSettingsPanel(QWidget):
         self.open_data_directory_button.clicked.connect(self.open_data_directory)
         self.cleanup_audit_button.clicked.connect(self.cleanup_expired_audit)
         self._refresh_products()
+        for label, field in (("首轮话术", self.first_contact_message_input), ("未下单追问", self.price_silence_follow_up_input)):
+            if field.toPlainText().strip():
+                try:
+                    validate_fixed_message(self.repository, field.toPlainText())
+                except FactGuardError as error:
+                    field.setToolTip(f"已保留原文；自动发送前会拦截：{error}")
+                    self._set_status(f"{label}需要核实：{error}。原文已保留。", error=True)
         self._refresh_media_assets()
 
     def save_configuration(self) -> None:
@@ -403,14 +457,22 @@ class CustomerServiceSettingsPanel(QWidget):
                 error=True,
             )
             return
+        if not catalog_message_prices_match(self.repository, message):
+            self._set_status("首轮话术中的价格与当前商品设置不一致，请修改后再保存。", error=True)
+            return
+        try:
+            validate_fixed_message(self.repository, message)
+        except FactGuardError as error:
+            self._set_status(f"首轮话术未保存：{error}", error=True)
+            return
         self.repository.set_setting(FIRST_CONTACT_MESSAGE_SETTING, message)
         self.first_contact_message_input.setPlainText(message)
-        self._set_status("首轮话术已保存，将对新的首次会话生效。")
+        self._set_status("首轮话术已保存，将对首次会话和满15分钟后的新问题生效。")
 
     def reset_first_contact_message(self) -> None:
         """Remove the override and restore the built-in reviewed catalog."""
         self.repository.delete_setting(FIRST_CONTACT_MESSAGE_SETTING)
-        self.first_contact_message_input.setPlainText(FIRST_CONTACT_CATALOG_REPLY)
+        self.first_contact_message_input.setPlainText(configured_catalog_reply(self.repository))
         self._set_status("首轮话术已恢复为默认内容。")
 
     def save_price_silence_follow_up(self) -> None:
@@ -425,6 +487,14 @@ class CustomerServiceSettingsPanel(QWidget):
                 error=True,
             )
             return
+        if not catalog_message_prices_match(self.repository, message):
+            self._set_status("未下单追问话术中的价格与当前商品设置不一致，请修改后再保存。", error=True)
+            return
+        try:
+            validate_fixed_message(self.repository, message)
+        except FactGuardError as error:
+            self._set_status(f"未下单追问未保存：{error}", error=True)
+            return
         self.repository.set_setting(PRICE_SILENCE_FOLLOW_UP_SETTING, message)
         self.price_silence_follow_up_input.setPlainText(message)
         self._set_status("未下单追问话术已保存，将用于符合条件的问价会话。")
@@ -434,6 +504,31 @@ class CustomerServiceSettingsPanel(QWidget):
         self.repository.delete_setting(PRICE_SILENCE_FOLLOW_UP_SETTING)
         self.price_silence_follow_up_input.clear()
         self._set_status("未下单追问话术已停用。")
+
+    def save_business_replies(self) -> None:
+        """Validate every edited phrase before writing any of them."""
+        try:
+            values = {
+                reply.key: validate_business_reply(
+                    reply, self.business_reply_inputs[reply.key].text()
+                )
+                for reply in BUSINESS_REPLIES
+            }
+            for value in values.values():
+                validate_fixed_message(self.repository, value)
+        except ValueError as error:
+            self._set_status(f"业务话术未保存：{error}", error=True)
+            return
+        for key, value in values.items():
+            self.repository.set_setting(BUSINESS_REPLY_SETTING_PREFIX + key, value)
+            self.business_reply_inputs[key].setText(value)
+        self._set_status("常见业务回复话术已保存，下次触发时生效。")
+
+    def reset_business_replies(self) -> None:
+        for reply in BUSINESS_REPLIES:
+            self.repository.delete_setting(BUSINESS_REPLY_SETTING_PREFIX + reply.key)
+            self.business_reply_inputs[reply.key].setText(reply.default)
+        self._set_status("常见业务回复话术已恢复默认内容。")
 
     def add_product(self) -> None:
         dialog = ProductKnowledgeDialog(parent=self)
@@ -660,16 +755,26 @@ class CustomerServiceSettingsPanel(QWidget):
         for product in self.repository.list_product_knowledge(include_disabled=False):
             row = self.product_table.rowCount()
             self.product_table.insertRow(row)
+            facts = product_facts(product)
+            chemistry_conflict = bool(facts.conflicts)
             values = (
                 product.product_key,
                 product.name,
                 product.platform_product_id or "",
                 product.listed_price or "",
                 product.minimum_price or "未设置",
-                "启用" if product.enabled else "停用",
+                "商品事实待核实" if chemistry_conflict else ("启用" if product.enabled else "停用"),
             )
             for column, value in enumerate(values):
-                self.product_table.setItem(row, column, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                if chemistry_conflict:
+                    item.setToolTip(
+                        "商品资料存在冲突：" + "、".join(facts.conflicts) + "。已保留原文，请编辑资料核实。"
+                    )
+                else:
+                    known = "、".join(facts.values)
+                    item.setToolTip(f"已解析属性：{known or '暂无'}；未明确的属性不自动推断。资料版本：{facts.version[:12]}")
+                self.product_table.setItem(row, column, item)
 
     def _refresh_media_assets(self) -> None:
         self.media_table.setRowCount(0)
@@ -758,15 +863,25 @@ class ProductKnowledgeDialog(QDialog):
         layout.addWidget(buttons)
         if product is not None:
             self._set_product(product)
+        self.specifications_input.setToolTip(
+            "建议逐行写：电池类型、型号、尺寸（带单位）、实测容量（Ah）、健康度（%）、循环次数、续航及适用条件。"
+            "标称容量与实测容量分开，未确认的属性留空；冲突资料不能用于自动回复。"
+        )
 
     def product(self) -> ProductKnowledge:
+        listed_text = self.listed_price_input.text().strip()
+        minimum_text = self.minimum_price_input.text().strip()
+        listed = parse_money(listed_text, field_name="商品标价") if listed_text else None
+        minimum = parse_money(minimum_text, field_name="最低可接受价") if minimum_text else None
+        if listed is not None and minimum is not None and minimum > listed:
+            raise ValueError("最低可接受价不能高于商品标价。")
         return ProductKnowledge(
             product_key=self.product_key_input.text().strip(),
             name=self.name_input.text().strip(),
             aliases=tuple(alias.strip() for alias in self.aliases_input.text().split(",") if alias.strip()),
             platform_product_id=self.platform_id_input.text().strip() or None,
-            listed_price=self.listed_price_input.text().strip() or None,
-            minimum_price=self.minimum_price_input.text().strip() or None,
+            listed_price=format_money(listed) if listed is not None else None,
+            minimum_price=format_money(minimum) if minimum is not None else None,
             specifications=self.specifications_input.toPlainText().strip(),
             inventory_notes=self.inventory_input.toPlainText().strip(),
             shipping_notes=self.shipping_input.toPlainText().strip(),
@@ -777,7 +892,9 @@ class ProductKnowledgeDialog(QDialog):
 
     def _accept_if_valid(self) -> None:
         try:
-            self.product()
+            facts = product_facts(self.product())
+            if facts.conflicts:
+                raise ValueError("商品属性有冲突，请核实后保存：" + "、".join(facts.conflicts))
         except ValueError as error:
             QMessageBox.warning(self, "商品知识无效", str(error))
             return

@@ -3,20 +3,34 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
-from xianyu_assistant.customer_service.fingerprints import normalize_for_matching
+from xianyu_assistant.customer_service.contact_policy import (
+    OrderEvidence,
+    contains_contact_template,
+    looks_like_full_catalog,
+)
+from xianyu_assistant.customer_service.fact_guard import product_facts
+from xianyu_assistant.customer_service.fingerprints import (
+    content_fingerprint,
+    normalize_for_matching,
+)
 from xianyu_assistant.customer_service.importer import ImportBundle
 from xianyu_assistant.customer_service.knowledge_importer import (
     CleanedKnowledgeBundle,
     CleanedKnowledgeDocument,
 )
+from xianyu_assistant.customer_service.message_roles import role_is_trusted
 from xianyu_assistant.customer_service.models import (
+    ChatMessage,
     ConversationFulfillmentState,
     ConversationSnapshot,
     ConversationSummary,
@@ -29,6 +43,7 @@ from xianyu_assistant.customer_service.models import (
     HandoffEvent,
     HistoricalExample,
     MediaAsset,
+    MessageDirection,
     PriceChangeDraft,
     PriceChangeStatus,
     ProductKnowledge,
@@ -38,23 +53,71 @@ from xianyu_assistant.customer_service.models import (
     SalesState,
 )
 from xianyu_assistant.customer_service.negotiation import NegotiationState
+from xianyu_assistant.customer_service.product_facts import (
+    BATTERY_CHEMISTRY_LINE,
+    BATTERY_CHEMISTRY_MIGRATION_SETTING,
+    CURRENT_TOWER_PRODUCT_KEYS,
+    battery_chemistry_status,
+)
 from xianyu_assistant.customer_service.retrieval import HistoricalExampleRetriever
+from xianyu_assistant.customer_service.send_checks import MAX_SEND_CHECKS, send_check_block_reason
+from xianyu_assistant.persistence.contact_storage import (
+    bind_contact,
+    close_contact,
+    contact_decision,
+    initialize_contact_storage,
+    observe_contact,
+    record_order,
+)
+from xianyu_assistant.persistence.contact_storage import (
+    contact_templates as stored_contact_templates,
+)
+from xianyu_assistant.persistence.recontact_storage import observe_recontact_turn, reserve_recontact
+from xianyu_assistant.persistence.runtime_storage import RuntimeStorage, initialize_runtime_storage
 
 
-class CustomerServiceRepository:
+class CustomerServiceRepository(RuntimeStorage):
     """Use short-lived connections so UI and worker threads stay isolated."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, busy_timeout_seconds: float = 1.0) -> None:
         self._database_path = database_path
+        if not 0 < busy_timeout_seconds <= 5:
+            raise ValueError("数据库等待预算必须大于0且不超过5秒。")
+        self.busy_timeout_seconds = busy_timeout_seconds
 
     @property
     def database_path(self) -> Path:
         """Expose the local data location for user-visible maintenance controls."""
         return self._database_path
 
-    def initialize(self) -> None:
+    def initialize(self, *, migrate_confirmed_facts: bool = True) -> None:
         """Create the additive customer-service schema and its indexes."""
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._database_path.is_file():
+            source = sqlite3.connect(self._database_path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                tables = {r[0] for r in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                backup_version = (
+                    "0.1.5" if "cs_send_attempts" not in tables else "0.1.6"
+                )
+                if "cs_products" in tables and "cs_product_fact_snapshots" not in tables:
+                    backup_version = "0.1.7"
+                contact_columns = {r[1] for r in source.execute("PRAGMA table_info(cs_contact_guards)")}
+                welcome_upgrade = "cs_products" in tables and "welcome_hold_reason" not in contact_columns
+                if welcome_upgrade:
+                    backup_version = "0.1.11"
+                if "cs_products" in tables and (welcome_upgrade or "cs_send_checks" not in tables or "cs_product_fact_snapshots" not in tables):
+                    backup_dir = self._database_path.parent / "backups"
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    backup_path = backup_dir / f"before-{backup_version}.db"
+                    if not backup_path.exists():
+                        target = sqlite3.connect(backup_path)
+                        try:
+                            source.backup(target)
+                        finally:
+                            target.close()
+            finally:
+                source.close()
         with self._connection() as connection:
             connection.executescript(
                 """
@@ -222,6 +285,67 @@ class CustomerServiceRepository:
                     content_expires_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS cs_quality_messages (
+                    conversation_key TEXT NOT NULL,
+                    message_key TEXT NOT NULL,
+                    run_id INTEGER,
+                    direction TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    text TEXT,
+                    platform_time TEXT,
+                    observed_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    content_fingerprint TEXT,
+                    source TEXT NOT NULL,
+                    attribution_send_id TEXT,
+                    platform_product_id TEXT,
+                    product_title TEXT,
+                    displayed_listing_price TEXT,
+                    PRIMARY KEY (conversation_key, message_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS cs_quality_sends (
+                    send_id TEXT PRIMARY KEY,
+                    run_id INTEGER,
+                    conversation_key TEXT NOT NULL,
+                    job_id TEXT,
+                    turn_id TEXT,
+                    mode TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    draft_text TEXT,
+                    final_text TEXT NOT NULL,
+                    reply_fingerprint TEXT NOT NULL,
+                    outgoing_message_key TEXT,
+                    failure_reason TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cs_quality_decisions (
+                    turn_id TEXT PRIMARY KEY,
+                    run_id INTEGER,
+                    conversation_key TEXT NOT NULL,
+                    customer_message_keys_json TEXT NOT NULL,
+                    semantic_json TEXT,
+                    decision_json TEXT,
+                    draft_text TEXT,
+                    status TEXT NOT NULL,
+                    failure_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS cs_quality_events (
+                    id INTEGER PRIMARY KEY,
+                    run_id INTEGER,
+                    conversation_key TEXT,
+                    event_type TEXT NOT NULL,
+                    detail TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS cs_processed_fingerprints (
                     batch_fingerprint TEXT PRIMARY KEY,
                     observed_at TEXT NOT NULL
@@ -235,6 +359,7 @@ class CustomerServiceRepository:
                     last_customer_offer TEXT,
                     last_counter TEXT,
                     accepted_price TEXT,
+                    last_checkout_guidance_variant INTEGER,
                     outcome TEXT,
                     repeated_offer_count INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
@@ -395,6 +520,12 @@ class CustomerServiceRepository:
                     ON cs_price_change_tasks(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_cs_run_sessions_expires
                     ON cs_run_sessions(content_expires_at);
+                CREATE INDEX IF NOT EXISTS idx_cs_quality_messages_seen
+                    ON cs_quality_messages(observed_at);
+                CREATE INDEX IF NOT EXISTS idx_cs_quality_sends_created
+                    ON cs_quality_sends(created_at);
+                CREATE INDEX IF NOT EXISTS idx_cs_quality_events_created
+                    ON cs_quality_events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_cs_negotiation_states_updated
                     ON cs_negotiation_states(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_cs_sales_states_due
@@ -529,6 +660,10 @@ class CustomerServiceRepository:
                 connection.execute(
                     "ALTER TABLE cs_customers ADD COLUMN shipped_at TEXT"
                 )
+            if "last_checkout_guidance_variant" not in customer_columns:
+                connection.execute(
+                    "ALTER TABLE cs_customers ADD COLUMN last_checkout_guidance_variant INTEGER"
+                )
             fulfillment_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -555,6 +690,335 @@ class CustomerServiceRepository:
                     connection.execute(
                         f"ALTER TABLE cs_run_sessions ADD COLUMN {column} TEXT"
                     )
+            quality_send_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(cs_quality_sends)").fetchall()
+            }
+            if "attempt_count" not in quality_send_columns:
+                connection.execute(
+                    "ALTER TABLE cs_quality_sends ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 1"
+                )
+            if "turn_id" not in quality_send_columns:
+                connection.execute("ALTER TABLE cs_quality_sends ADD COLUMN turn_id TEXT")
+            for column, definition in (
+                ("stage", "TEXT"), ("click_state", "TEXT"), ("evidence_json", "TEXT"),
+                ("next_check_at", "TEXT"), ("recheck_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in quality_send_columns:
+                    connection.execute(f"ALTER TABLE cs_quality_sends ADD COLUMN {column} {definition}")
+            if "related_send_id" not in handoff_columns:
+                connection.execute("ALTER TABLE cs_handoff_events ADD COLUMN related_send_id TEXT")
+            if "heartbeat_at" not in run_columns:
+                connection.execute("ALTER TABLE cs_run_sessions ADD COLUMN heartbeat_at TEXT")
+            connection.executescript("""
+                CREATE TABLE IF NOT EXISTS cs_send_attempts (
+                    attempt_id TEXT PRIMARY KEY, send_id TEXT NOT NULL, run_id INTEGER,
+                    conversation_key TEXT NOT NULL, stage TEXT NOT NULL,
+                    click_state TEXT NOT NULL, result TEXT, exception_type TEXT,
+                    exception_detail TEXT, traceback_text TEXT, evidence_json TEXT,
+                    program_version TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_cs_send_attempts_send ON cs_send_attempts(send_id);
+                CREATE INDEX IF NOT EXISTS idx_cs_send_recheck ON cs_quality_sends(status, next_check_at);
+                CREATE TABLE IF NOT EXISTS cs_send_checks (
+                    check_id TEXT PRIMARY KEY, send_id TEXT NOT NULL, run_id INTEGER,
+                    conversation_key TEXT NOT NULL, check_number INTEGER NOT NULL,
+                    stage TEXT NOT NULL, result TEXT NOT NULL,
+                    exception_type TEXT, exception_detail TEXT, traceback_text TEXT,
+                    diagnostic_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_cs_send_checks_send ON cs_send_checks(send_id);
+                CREATE TABLE IF NOT EXISTS cs_product_fact_snapshots (
+                    product_key TEXT PRIMARY KEY REFERENCES cs_products(product_key) ON DELETE CASCADE,
+                    version TEXT NOT NULL, facts_json TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS cs_fact_generation_versions (
+                    entity_type TEXT NOT NULL, entity_key TEXT NOT NULL, version TEXT NOT NULL,
+                    PRIMARY KEY(entity_type, entity_key)
+                );
+            """)
+            initialize_contact_storage(connection, _timestamp(datetime.now().astimezone()))
+            initialize_runtime_storage(connection)
+        if migrate_confirmed_facts:
+            self._migrate_confirmed_facts()
+
+    def _migrate_confirmed_facts(self) -> None:
+        """Apply the operator's Oct 5 confirmations once, preserving other fields.
+
+        Unknown or differently edited warranties are retained for conflict review.
+        Prices, aliases, platform bindings, chat history and manual locks are untouched.
+        """
+        marker = "confirmed_tower_facts_20261005_v1"
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM cs_settings WHERE name=?", (marker,)).fetchone() is None:
+                for key in CURRENT_TOWER_PRODUCT_KEYS:
+                    row = connection.execute("SELECT * FROM cs_products WHERE product_key=?", (key,)).fetchone()
+                    if row is None:
+                        continue
+                    specs = re.sub(r"(尺寸\s*[:：]\s*\d+(?:\.\d+)?\s*[-×x*]\s*\d+(?:\.\d+)?\s*[-×x*]\s*\d+(?:\.\d+)?)(?=\s*(?:\n|$))", r"\1cm", row["specifications"])
+                    if "循环" not in specs + row["supplementary_knowledge"]:
+                        specs = specs.rstrip() + "\n循环次数：约100次"
+                    after = re.sub(r"(质保|保修)\s*(?:一|1)年", r"\1三年", row["after_sales_notes"])
+                    if not re.search(r"质保|保修", after):
+                        after = after.rstrip() + "\n质保：三年"
+                    supp = re.sub(r"(质保|保修)\s*(?:一|1)年", r"\1三年", row["supplementary_knowledge"])
+                    specs = re.sub(r"(质保|保修)\s*(?:一|1)年", r"\1三年", specs)
+                    connection.execute("UPDATE cs_products SET specifications=?,after_sales_notes=?,supplementary_knowledge=?,updated_at=? WHERE product_key=?", (specs, after, supp, _timestamp(), key))
+                connection.execute("INSERT INTO cs_settings(name,value) VALUES (?,?)", (marker, "尺寸单位cm；质保三年；循环次数约100次；经营者确认"))
+            wording_marker = "fixed_follow_up_shipping_sync_20261005_v1"
+            if connection.execute("SELECT 1 FROM cs_settings WHERE name=?", (wording_marker,)).fetchone() is None:
+                original = connection.execute("SELECT value FROM cs_settings WHERE name='price_silence_follow_up_message'").fetchone()
+                if original and "全国包邮发货，除了新疆、西藏" in original[0]:
+                    connection.execute("INSERT OR IGNORE INTO cs_settings(name,value) VALUES (?,?)", ("price_silence_follow_up_before_fact_sync_20261005", original[0]))
+                    revised = original[0].replace("全国包邮发货，除了新疆、西藏", "默认包邮，新疆、内蒙古、西藏不包邮，海南不发货")
+                    connection.execute("UPDATE cs_settings SET value=? WHERE name='price_silence_follow_up_message'", (revised,))
+                connection.execute("INSERT INTO cs_settings(name,value) VALUES (?,?)", (wording_marker, "将已识别的旧发货说明同步至现有商品限制，原话术单独保存"))
+            for row in connection.execute("SELECT * FROM cs_products").fetchall():
+                self._save_fact_snapshot(connection, self._product_from_row(connection, row))
+
+    @staticmethod
+    def _save_fact_snapshot(connection: sqlite3.Connection, product: ProductKnowledge) -> None:
+        facts = product_facts(product)
+        connection.execute("""INSERT INTO cs_product_fact_snapshots(product_key,version,facts_json,updated_at)
+            VALUES (?,?,?,?) ON CONFLICT(product_key) DO UPDATE SET
+            version=excluded.version,facts_json=excluded.facts_json,updated_at=excluded.updated_at
+            WHERE cs_product_fact_snapshots.version != excluded.version""",
+            (product.product_key, facts.version, json.dumps(facts.as_data(), ensure_ascii=False), _timestamp()))
+
+    def get_quality_send(self, send_id: str) -> dict[str, object] | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM cs_quality_sends WHERE send_id = ?", (send_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_fact_generation_version(self, entity_type: str, entity_key: str, version: str) -> None:
+        with self._connection() as connection:
+            connection.execute("INSERT OR REPLACE INTO cs_fact_generation_versions VALUES (?,?,?)",
+                               (entity_type, entity_key, version))
+
+    def load_fact_generation_version(self, entity_type: str, entity_key: str) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute("SELECT version FROM cs_fact_generation_versions WHERE entity_type=? AND entity_key=?", (entity_type, entity_key)).fetchone()
+        return str(row[0]) if row is not None else None
+
+    def start_send_attempt(self, *, attempt_id: str, send_id: str, run_id: int | None,
+                           conversation_key: str, created_at: datetime,
+                           program_version: str) -> None:
+        with self._connection() as connection:
+            connection.execute("""INSERT INTO cs_send_attempts
+                (attempt_id,send_id,run_id,conversation_key,stage,click_state,
+                 program_version,created_at,updated_at)
+                VALUES (?,?,?,?,'preflight','not_started',?,?,?)""",
+                (attempt_id, send_id, run_id, conversation_key, program_version,
+                 _timestamp(created_at), _timestamp(created_at)))
+
+    def update_send_attempt(self, attempt_id: str, *, stage: str, click_state: str,
+                            updated_at: datetime, result: str | None = None,
+                            exception_type: str | None = None, exception_detail: str | None = None,
+                            traceback_text: str | None = None,
+                            evidence: dict[str, object] | None = None) -> None:
+        with self._connection() as connection:
+            connection.execute("""UPDATE cs_send_attempts SET stage=?,click_state=?,result=?,
+                exception_type=?,exception_detail=?,traceback_text=?,evidence_json=?,updated_at=?
+                WHERE attempt_id=?""", (stage, click_state, result, exception_type,
+                exception_detail, traceback_text, json.dumps(evidence or {}, ensure_ascii=False),
+                _timestamp(updated_at), attempt_id))
+
+    def set_send_progress(self, send_id: str, *, status: str, stage: str, click_state: str,
+                          evidence: dict[str, object], updated_at: datetime,
+                          failure_reason: str | None = None,
+                          next_check_at: datetime | None = None) -> None:
+        with self._connection() as connection:
+            connection.execute("""UPDATE cs_quality_sends SET status=?,stage=?,click_state=?,
+                evidence_json=?,failure_reason=?,next_check_at=?,updated_at=? WHERE send_id=?""",
+                (status, stage, click_state, json.dumps(evidence, ensure_ascii=False), failure_reason,
+                 _timestamp(next_check_at) if next_check_at else None, _timestamp(updated_at), send_id))
+            connection.execute("UPDATE cs_send_outbox SET status=?,updated_at=? WHERE send_id=?",
+                               (status, _timestamp(updated_at), send_id))
+
+    def complete_reliable_send(self, send_id: str, *, outgoing_message_key: str,
+                               updated_at: datetime) -> None:
+        """Commit confirmation, deduplication and the message attribution together."""
+        now = _timestamp(updated_at)
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM cs_quality_sends WHERE send_id=?", (send_id,)).fetchone()
+            if row is None:
+                raise ValueError("没有可确认的发送记录。")
+            connection.execute("""UPDATE cs_quality_sends SET status='verified',stage='complete',
+                click_state='confirmed',outgoing_message_key=?,failure_reason=NULL,
+                next_check_at=NULL,updated_at=? WHERE send_id=?""", (outgoing_message_key, now, send_id))
+            connection.execute("""UPDATE cs_quality_messages SET source=?,attribution_send_id=?
+                WHERE conversation_key=? AND message_key=? AND direction='outgoing'""",
+                (row["origin"], send_id, row["conversation_key"], outgoing_message_key))
+            outbox = connection.execute("SELECT * FROM cs_send_outbox WHERE send_id=?", (send_id,)).fetchone()
+            if outbox is not None:
+                connection.execute("""UPDATE cs_send_outbox SET status='sent_verified',
+                    outgoing_message_key=?,updated_at=? WHERE send_id=?""", (outgoing_message_key, now, send_id))
+                connection.execute("""UPDATE cs_conversation_states SET last_handled_message_key=?,
+                    updated_at=? WHERE conversation_key=?""",
+                    (outbox["expected_last_message_key"], now, row["conversation_key"]))
+                connection.execute("UPDATE cs_customer_turns SET status='sent',updated_at=? WHERE turn_id=?",
+                                   (now, outbox["turn_id"]))
+            if row["job_id"]:
+                job = connection.execute("SELECT batch_fingerprint FROM cs_reply_jobs WHERE job_id=?",
+                                         (row["job_id"],)).fetchone()
+                if job is not None:
+                    connection.execute("""INSERT OR IGNORE INTO cs_processed_fingerprints
+                        (batch_fingerprint,observed_at) VALUES (?,?)""", (job["batch_fingerprint"], now))
+                connection.execute("""UPDATE cs_reply_jobs SET status='sent',failure_reason=NULL,
+                    updated_at=? WHERE job_id=?""", (now, row["job_id"]))
+                connection.execute("""UPDATE cs_first_contact_catalog SET status='sent',updated_at=?
+                    WHERE reservation_id=?""", (now, row["job_id"]))
+            key = bind_contact(connection, str(row["conversation_key"]), now)
+            close_contact(connection, key, "verified_merchant_reply", now)
+            connection.execute("""UPDATE cs_recontact_windows SET status=?,updated_at=?
+                WHERE contact_key=? AND status IN ('eligible','reserved')
+                AND (reservation_id=? OR turn_id=?)""",
+                ("sent" if row["contains_welcome"] else "answered", now, key, send_id, row["turn_id"]))
+            connection.execute("""UPDATE cs_contact_guards SET welcome_status='sent',updated_at=?
+                WHERE reservation_id=?""", (now, send_id))
+            connection.execute("""UPDATE cs_submission_tombstones SET state='verified',failure_code=NULL,
+                outgoing_message_key=?,updated_at=? WHERE action_id=?""",
+                (outgoing_message_key, now, send_id))
+
+    def list_due_send_checks(self, *, now: datetime, limit: int = 2) -> list[dict[str, object]]:
+        with self._connection() as connection:
+            rows = connection.execute("""SELECT * FROM cs_quality_sends WHERE status='uncertain'
+                AND next_check_at IS NOT NULL AND next_check_at<=? AND recheck_count<2
+                ORDER BY next_check_at LIMIT ?""", (_timestamp(now), limit)).fetchall()
+        return [dict(row) for row in rows]
+
+    def prepare_send_checks(self, *, now: datetime, run_id: int | None) -> int:
+        """Called under exclusive reception ownership, after journal recovery."""
+        retired = 0
+        with self._connection() as connection:
+            connection.execute("""UPDATE cs_send_checks SET result='interrupted',
+                exception_detail='上次只读核对未完成，次数已保留，不会重新提交消息。',updated_at=?
+                WHERE result='checking'""", (_timestamp(now),))
+            rows = connection.execute("""SELECT * FROM cs_quality_sends
+                WHERE next_check_at IS NOT NULL""").fetchall()
+            for raw in rows:
+                row = dict(raw)
+                reason = send_check_block_reason(row, now)
+                if row["status"] != "uncertain":
+                    connection.execute("UPDATE cs_quality_sends SET next_check_at=NULL WHERE send_id=?",
+                                       (row["send_id"],))
+                    continue
+                if reason:
+                    self._retire_send_check(connection, row, now=now, reason=reason, run_id=run_id)
+                    retired += 1
+        return retired
+
+    def _retire_send_check(self, connection: sqlite3.Connection, row: dict[str, object], *,
+                           now: datetime, reason: str, run_id: int | None) -> None:
+        connection.execute("""UPDATE cs_quality_sends SET next_check_at=NULL,updated_at=?
+            WHERE send_id=? AND status='uncertain'""", (_timestamp(now), row["send_id"]))
+        connection.execute("""UPDATE cs_handoff_events SET reason=reason || ?
+            WHERE related_send_id=? AND handoff_type='technical_send' AND status='open'""",
+            ("；" + reason, row["send_id"]))
+        connection.execute("""INSERT INTO cs_send_checks
+            (check_id,send_id,run_id,conversation_key,check_number,stage,result,
+             exception_detail,created_at,updated_at) VALUES (?,?,?,?,?,'eligibility','manual_required',?,?,?)""",
+            (uuid4().hex, row["send_id"], run_id, row["conversation_key"], row["recheck_count"],
+             reason, _timestamp(now), _timestamp(now)))
+
+    def begin_send_check(self, row: dict[str, object], *, check_id: str,
+                         run_id: int | None, now: datetime) -> bool:
+        """Consume a read-only attempt before DOM access, including across crashes."""
+        with self._connection() as connection:
+            current = connection.execute("SELECT * FROM cs_quality_sends WHERE send_id=?",
+                                         (row["send_id"],)).fetchone()
+            if current is None or current["status"] != "uncertain" or current["next_check_at"] is None:
+                return False
+            reason = send_check_block_reason(dict(current), now)
+            if reason:
+                self._retire_send_check(connection, dict(current), now=now, reason=reason, run_id=run_id)
+                return False
+            count = int(current["recheck_count"]) + 1
+            # This durable lease prevents a killed process from retrying the same attempt immediately.
+            next_time = now + timedelta(seconds=30) if count < MAX_SEND_CHECKS else None
+            changed = connection.execute("""UPDATE cs_quality_sends SET recheck_count=?,
+                next_check_at=?,updated_at=? WHERE send_id=? AND status='uncertain'
+                AND recheck_count=? AND next_check_at<=?""",
+                (count, _timestamp(next_time) if next_time else None, _timestamp(now), row["send_id"],
+                 current["recheck_count"], _timestamp(now)))
+            if changed.rowcount != 1:
+                return False
+            connection.execute("""INSERT INTO cs_send_checks
+                (check_id,send_id,run_id,conversation_key,check_number,stage,result,created_at,updated_at)
+                VALUES (?,?,?,?,?,'open_conversation','checking',?,?)""",
+                (check_id, row["send_id"], run_id, row["conversation_key"], count,
+                 _timestamp(now), _timestamp(now)))
+        return True
+
+    def finish_send_check(self, send_id: str, *, check_id: str, now: datetime, reason: str,
+                          next_check_at: datetime | None, stage: str, result: str,
+                          exception_type: str = "", traceback_text: str = "",
+                          diagnostic: dict[str, object] | None = None) -> None:
+        with self._connection() as connection:
+            connection.execute("""UPDATE cs_quality_sends SET
+                failure_reason=?,next_check_at=?,updated_at=? WHERE send_id=? AND status='uncertain'""",
+                (reason[:1000], _timestamp(next_check_at) if next_check_at else None, _timestamp(now), send_id))
+            connection.execute("""UPDATE cs_send_checks SET stage=?,result=?,exception_type=?,
+                exception_detail=?,traceback_text=?,diagnostic_json=?,updated_at=? WHERE check_id=?""",
+                (stage, result, exception_type or None, reason[:1000], traceback_text[-8000:] or None,
+                 json.dumps(diagnostic or {}, ensure_ascii=False), _timestamp(now), check_id))
+            if result != "verified":
+                connection.execute("""UPDATE cs_handoff_events SET reason=?
+                    WHERE related_send_id=? AND handoff_type='technical_send' AND status='open'""",
+                    (reason[:1600], send_id))
+
+    def resolve_technical_send(self, send_id: str) -> None:
+        """Release only the technical lock owned by this confirmed send."""
+        with self._connection() as connection:
+            verified = connection.execute("""SELECT conversation_key FROM cs_quality_sends
+                WHERE send_id=? AND status='verified'""", (send_id,)).fetchone()
+            if verified is None:
+                return
+            rows = connection.execute("""SELECT id FROM cs_handoff_events WHERE related_send_id=?
+                AND handoff_type='technical_send' AND status='open'""", (send_id,)).fetchall()
+        for row in rows:
+            self.resolve_handoff_event(int(row["id"]))
+
+    def recover_abandoned_runs(self, *, now: datetime) -> None:
+        """Called only while holding the exclusive reception lock."""
+        with self._connection() as connection:
+            connection.execute("""UPDATE cs_run_sessions SET status='interrupted',
+                stopped_at=COALESCE(heartbeat_at,started_at),stop_reason='上次运行未正常结束，已保留待核对发送。'
+                WHERE status='running' AND stopped_at IS NULL""")
+
+    def touch_run_session(self, run_id: int, *, now: datetime) -> None:
+        with self._connection() as connection:
+            connection.execute("UPDATE cs_run_sessions SET heartbeat_at=? WHERE id=?",
+                               (_timestamp(now), run_id))
+
+    def defer_sales_follow_up(
+        self, conversation_key: str, reason: str = "", *, due_at: datetime | None = None,
+        delay_seconds: float = 60, max_attempts: int = 2, now: datetime | None = None,
+        infrastructure_failure: bool = False,
+    ) -> bool:
+        """Persist finite pre-submit retries; infrastructure gaps consume no retry."""
+        current = now or datetime.now().astimezone()
+        due = due_at or current + timedelta(seconds=delay_seconds)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM cs_sales_states WHERE conversation_key=?",
+                                     (conversation_key,)).fetchone()
+            if row is None or row["status"] != "pending":
+                return False
+            expiry = (_parse_or_now(row["follow_up_expires_at"]) if row["follow_up_expires_at"]
+                      else _parse_or_now(row["follow_up_due_at"] or row["updated_at"]) + timedelta(hours=2))
+            retries = int(row["pre_submit_retry_count"]) + (0 if infrastructure_failure else 1)
+            if current >= expiry or due >= expiry or retries > max_attempts:
+                connection.execute("""UPDATE cs_sales_states SET status='cancelled',
+                    follow_up_text=NULL,follow_up_due_at=NULL,defer_reason=?,updated_at=?
+                    WHERE conversation_key=?""", (reason or "追问重试或时效已用完", _timestamp(current), conversation_key))
+                return False
+            connection.execute("""UPDATE cs_sales_states SET follow_up_due_at=?,
+                pre_submit_retry_count=?,defer_reason=?,follow_up_expires_at=?,updated_at=?
+                WHERE conversation_key=? AND status='pending'""",
+                (_timestamp(due), retries, reason[:500], _timestamp(expiry), _timestamp(current), conversation_key))
+        return True
 
     def get_setting(self, name: str, default: str | None = None) -> str | None:
         """Read a non-secret application setting."""
@@ -588,6 +1052,8 @@ class CustomerServiceRepository:
         failure_stage: str | None = None,
         conversation_ref: str | None = None,
         exception_type: str | None = None,
+        failure_code: str | None = None,
+        recovery_state: str | None = None,
     ) -> None:
         """Finish a reception run without storing chat text or credentials."""
         with self._connection() as connection:
@@ -596,7 +1062,7 @@ class CustomerServiceRepository:
                 UPDATE cs_run_sessions
                 SET status = ?, stopped_at = ?, stop_reason = ?,
                     failure_category = ?, failure_stage = ?,
-                    conversation_ref = ?, exception_type = ?
+                    conversation_ref = ?, exception_type = ?, failure_code = ?, recovery_state = ?
                 WHERE id = ?
                 """,
                 (
@@ -607,13 +1073,243 @@ class CustomerServiceRepository:
                     (failure_stage or "")[:80] or None,
                     (conversation_ref or "")[:80] or None,
                     (exception_type or "")[:80] or None,
+                    (failure_code or "")[:80] or None,
+                    (recovery_state or "")[:80] or None,
                     run_id,
                 ),
+            )
+
+    def record_quality_snapshot(
+        self,
+        snapshot: ConversationSnapshot,
+        *,
+        run_id: int | None,
+        observed_at: datetime,
+    ) -> None:
+        """Idempotently retain the page-visible message sequence for later review."""
+        seen = _timestamp(observed_at)
+        with self._connection() as connection:
+            for message in snapshot.messages:
+                fingerprint = content_fingerprint(message.text or "") if message.text else None
+                source = {"incoming": "customer", "outgoing": "merchant_external"}.get(
+                    message.direction.value, "role_uncertain")
+                attribution_send_id = None
+                if message.direction is MessageDirection.OUTGOING:
+                    verified = connection.execute(
+                        """SELECT send_id, origin FROM cs_quality_sends
+                           WHERE conversation_key = ? AND outgoing_message_key = ?
+                             AND status = 'verified' LIMIT 1""",
+                        (snapshot.conversation_key, message.message_key),
+                    ).fetchone()
+                    if verified is not None:
+                        source = str(verified["origin"])
+                        attribution_send_id = str(verified["send_id"])
+                    elif fingerprint is not None:
+                        uncertain = connection.execute(
+                            """SELECT 1 FROM cs_quality_sends
+                               WHERE conversation_key = ? AND reply_fingerprint = ?
+                                 AND (status IN ('prepared', 'sending', 'uncertain')
+                                      OR (status = 'verified' AND outgoing_message_key IS NULL))
+                               LIMIT 1""",
+                            (snapshot.conversation_key, fingerprint),
+                        ).fetchone()
+                        if uncertain is not None:
+                            source = "merchant_source_uncertain"
+                connection.execute(
+                    """
+                    INSERT INTO cs_quality_messages (
+                        conversation_key, message_key, run_id, direction, message_type,
+                        text, platform_time, observed_at, last_seen_at,
+                        content_fingerprint, source, attribution_send_id,
+                        platform_product_id, product_title, displayed_listing_price
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_key, message_key) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at,
+                        text = excluded.text,
+                        platform_time = COALESCE(excluded.platform_time, cs_quality_messages.platform_time),
+                        content_fingerprint = excluded.content_fingerprint,
+                        direction = CASE WHEN cs_quality_messages.source IN
+                            ('application_auto', 'application_reviewed')
+                            THEN 'outgoing' ELSE excluded.direction END,
+                        source = CASE WHEN cs_quality_messages.source IN
+                            ('application_auto', 'application_reviewed')
+                            THEN cs_quality_messages.source ELSE excluded.source END,
+                        attribution_send_id = COALESCE(
+                            excluded.attribution_send_id, cs_quality_messages.attribution_send_id),
+                        platform_product_id = COALESCE(excluded.platform_product_id,
+                            cs_quality_messages.platform_product_id),
+                        product_title = COALESCE(excluded.product_title,
+                            cs_quality_messages.product_title),
+                        displayed_listing_price = COALESCE(excluded.displayed_listing_price,
+                            cs_quality_messages.displayed_listing_price)
+                    """,
+                    (
+                        snapshot.conversation_key,
+                        message.message_key,
+                        run_id,
+                        message.direction.value,
+                        message.kind.value,
+                        message.text,
+                        _timestamp(message.platform_time) if message.platform_time else None,
+                        _timestamp(message.observed_at) if message.observed_at else seen,
+                        seen,
+                        fingerprint,
+                        source,
+                        attribution_send_id,
+                        snapshot.platform_product_id,
+                        snapshot.product_title,
+                        snapshot.displayed_listing_price,
+                    ),
+                )
+                connection.execute("""UPDATE cs_quality_messages SET role_source=?,key_source=?,
+                    raw_direction=?,role_confidence=?,role_evidence_json=?
+                    WHERE conversation_key=? AND message_key=?""",
+                    (message.role_source, message.key_source, message.raw_direction,
+                     message.role_confidence, message.role_evidence_json,
+                     snapshot.conversation_key, message.message_key))
+            for event in snapshot.system_events:
+                connection.execute(
+                    """INSERT INTO cs_quality_messages (
+                        conversation_key, message_key, run_id, direction, message_type,
+                        text, observed_at, last_seen_at, content_fingerprint, source,
+                        platform_product_id, product_title, displayed_listing_price
+                    ) VALUES (?, ?, ?, 'platform', ?, ?, ?, ?, ?, 'platform_system', ?, ?, ?)
+                    ON CONFLICT(conversation_key, message_key) DO UPDATE SET
+                        last_seen_at = excluded.last_seen_at,
+                        text = excluded.text""",
+                    (
+                        snapshot.conversation_key, f"system:{event.event_key}", run_id,
+                        event.kind.value, event.text, seen, seen,
+                        content_fingerprint(event.text), snapshot.platform_product_id,
+                        snapshot.product_title, snapshot.displayed_listing_price,
+                    ),
+                )
+
+    def record_quality_send(
+        self,
+        *,
+        send_id: str,
+        run_id: int | None,
+        conversation_key: str,
+        job_id: str | None,
+        mode: str,
+        origin: str,
+        draft_text: str | None,
+        final_text: str,
+        created_at: datetime,
+        turn_id: str | None = None,
+    ) -> None:
+        stamp = _timestamp(created_at)
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO cs_quality_sends (
+                    send_id, run_id, conversation_key, job_id, turn_id, mode, origin, status,
+                    draft_text, final_text, reply_fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)
+                ON CONFLICT(send_id) DO UPDATE SET
+                    draft_text = excluded.draft_text,
+                    final_text = excluded.final_text,
+                    reply_fingerprint = excluded.reply_fingerprint,
+                    status = 'prepared',
+                    failure_reason = NULL,
+                    attempt_count = cs_quality_sends.attempt_count + 1,
+                    updated_at = excluded.updated_at
+                WHERE cs_quality_sends.status = 'not_performed'""",
+                (send_id, run_id, conversation_key, job_id, turn_id, mode, origin, draft_text,
+                 final_text, content_fingerprint(final_text), stamp, stamp),
+            )
+
+    def update_quality_send(
+        self,
+        send_id: str,
+        *,
+        status: str,
+        updated_at: datetime,
+        outgoing_message_key: str | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        stamp = _timestamp(updated_at)
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE cs_quality_sends SET status = ?, updated_at = ?,
+                    outgoing_message_key = COALESCE(?, outgoing_message_key),
+                    failure_reason = ? WHERE send_id = ?""",
+                (status, stamp, outgoing_message_key, failure_reason, send_id),
+            )
+            if status == "verified" and outgoing_message_key:
+                connection.execute(
+                    """UPDATE cs_quality_messages SET
+                        source = (SELECT origin FROM cs_quality_sends WHERE send_id = ?),
+                        attribution_send_id = ?
+                        WHERE conversation_key = (SELECT conversation_key FROM cs_quality_sends WHERE send_id = ?)
+                          AND message_key = ? AND direction = 'outgoing'""",
+                    (send_id, send_id, send_id, outgoing_message_key),
+                )
+
+    def record_quality_decision(
+        self,
+        *,
+        turn_id: str,
+        run_id: int | None,
+        conversation_key: str,
+        customer_message_keys: tuple[str, ...],
+        semantic_json: str,
+        decision_json: str,
+        draft_text: str,
+        status: str,
+        updated_at: datetime,
+    ) -> None:
+        stamp = _timestamp(updated_at)
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO cs_quality_decisions (
+                    turn_id, run_id, conversation_key, customer_message_keys_json,
+                    semantic_json, decision_json, draft_text, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(turn_id) DO UPDATE SET
+                    semantic_json = excluded.semantic_json,
+                    decision_json = excluded.decision_json,
+                    draft_text = excluded.draft_text,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at""",
+                (turn_id, run_id, conversation_key,
+                 json.dumps(customer_message_keys, ensure_ascii=False), semantic_json,
+                 decision_json, draft_text, status, stamp, stamp),
+            )
+
+    def update_quality_decision_status(
+        self, turn_id: str, *, status: str, updated_at: datetime,
+        failure_reason: str | None = None,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """UPDATE cs_quality_decisions SET status = ?, failure_reason = ?,
+                    updated_at = ? WHERE turn_id = ?""",
+                (status, failure_reason, _timestamp(updated_at), turn_id),
+            )
+
+    def record_quality_event(
+        self, *, run_id: int | None, conversation_key: str | None,
+        event_type: str, detail: str | None, created_at: datetime,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                """INSERT INTO cs_quality_events (
+                    run_id, conversation_key, event_type, detail, created_at
+                ) VALUES (?, ?, ?, ?, ?)""",
+                (run_id, conversation_key, event_type, (detail or "")[:500], _timestamp(created_at)),
             )
 
     def set_setting(self, name: str, value: str) -> None:
         """Persist a non-secret setting; callers must never pass API keys."""
         with self._connection() as connection:
+            if name == "first_contact_message":
+                old = connection.execute("SELECT value FROM cs_settings WHERE name=?", (name,)).fetchone()
+                for text in (str(old[0]) if old else "", value):
+                    if text.strip():
+                        connection.execute("""INSERT OR IGNORE INTO cs_contact_templates
+                            (template_fingerprint,message_text,created_at) VALUES(?,?,?)""",
+                            (content_fingerprint(text), text, _timestamp(datetime.now().astimezone())))
             connection.execute(
                 """
                 INSERT INTO cs_settings (name, value) VALUES (?, ?)
@@ -637,6 +1333,7 @@ class CustomerServiceRepository:
         """Create or refresh a durable customer profile from a chat-list row."""
         now = _timestamp(observed_at)
         with self._connection() as connection:
+            bind_contact(connection, summary.conversation_key, now, summary.platform_customer_id, summary.merchant_account_id)
             mapped = connection.execute(
                 """
                 SELECT customer_key FROM cs_customer_conversations
@@ -817,6 +1514,11 @@ class CustomerServiceRepository:
             next_lifecycle = _advanced_customer_lifecycle(current_lifecycle, lifecycle)
             current_intent = CustomerIntentLevel(str(current["intent_level"]))
             next_intent = _stronger_customer_intent(current_intent, intent_level)
+            order_progress = {CustomerOrderStatus.PENDING_PAYMENT: 1,
+                              CustomerOrderStatus.ORDERED: 2, CustomerOrderStatus.AFTER_SALES: 3}
+            previous_order = CustomerOrderStatus(str(current["order_status"]))
+            if order_progress.get(previous_order, 0) > order_progress.get(order_status, 0):
+                order_status = previous_order
             follow_up_value = (
                 None
                 if clear_next_follow_up
@@ -957,6 +1659,37 @@ class CustomerServiceRepository:
                 (event_key, customer_key, conversation_key, lifecycle, lifecycle, now),
             )
 
+    def load_checkout_guidance_variant(self, conversation_key: str) -> int | None:
+        """Read the last verified checkout wording for this customer across chats."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT customer.last_checkout_guidance_variant AS variant
+                   FROM cs_customer_conversations AS link
+                   JOIN cs_customers AS customer ON customer.customer_key = link.customer_key
+                   WHERE link.conversation_key = ?""",
+                (conversation_key,),
+            ).fetchone()
+        return int(row["variant"]) if row is not None and row["variant"] is not None else None
+
+    def mark_checkout_guidance_sent(
+        self, conversation_key: str, *, variant: int, sent_at: datetime
+    ) -> None:
+        """Advance wording only after the platform confirms the outgoing message."""
+        if variant < 0:
+            raise ValueError("下单引导话术编号不能为负数。")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """UPDATE cs_customers
+                   SET last_checkout_guidance_variant = ?, updated_at = ?
+                   WHERE customer_key = (
+                       SELECT customer_key FROM cs_customer_conversations
+                       WHERE conversation_key = ?
+                   )""",
+                (variant, _timestamp(sent_at), conversation_key),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("下单引导话术状态缺少顾客映射。")
+
     def get_customer_profile(self, customer_key: str) -> CustomerProfile | None:
         """Read one durable customer profile."""
         with self._connection() as connection:
@@ -1038,9 +1771,16 @@ class CustomerServiceRepository:
         snapshot_has_outgoing: bool,
     ) -> bool:
         """Return whether this is a genuinely new customer conversation."""
-        if not conversation_key or snapshot_has_outgoing:
+        if not conversation_key:
             return False
         with self._connection() as connection:
+            policy = contact_decision(connection, conversation_key)
+            if not policy["allowed"]:
+                return False
+            if policy.get("recontact"):
+                return True
+            if snapshot_has_outgoing:
+                return False
             if connection.execute(
                 "SELECT 1 FROM cs_first_contact_catalog WHERE conversation_key = ?",
                 (conversation_key,),
@@ -1078,6 +1818,14 @@ class CustomerServiceRepository:
             return False
         now = _timestamp(created_at)
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            bind_contact(connection, conversation_key, now)
+            policy = contact_decision(connection, conversation_key, reservation_id)
+            if policy.get("recontact"):
+                return reserve_recontact(connection, policy, reservation_id=reservation_id,
+                                         reply_fingerprint=reply_fingerprint, now=now)
+            if not policy["allowed"]:
+                return False
             existing = connection.execute(
                 """
                 SELECT reservation_id, status, reply_fingerprint
@@ -1118,6 +1866,10 @@ class CustomerServiceRepository:
                 """,
                 (conversation_key, reservation_id, reply_fingerprint, now, now),
             )
+            connection.execute("""UPDATE cs_contact_guards SET welcome_status='reserved',
+                reservation_id=?,reply_fingerprint=?,updated_at=?
+                WHERE contact_key=(SELECT contact_key FROM cs_contact_bindings WHERE conversation_key=?)""",
+                (reservation_id, reply_fingerprint, now, conversation_key))
         return True
 
     def release_first_contact_catalog_reservation(
@@ -1128,6 +1880,13 @@ class CustomerServiceRepository:
     ) -> None:
         """Release only when the adapter proves that no send action occurred."""
         with self._connection() as connection:
+            connection.execute("""UPDATE cs_recontact_windows SET status='eligible',
+                reservation_id=NULL,reply_fingerprint=NULL WHERE reservation_id=? AND status='reserved'""",
+                (reservation_id,))
+            connection.execute("""UPDATE cs_contact_guards SET welcome_status='eligible',
+                reservation_id=NULL,reply_fingerprint=NULL WHERE reservation_id=?
+                AND welcome_status='reserved' AND closed_reason IS NULL AND order_state IS NULL""",
+                (reservation_id,))
             connection.execute(
                 """
                 DELETE FROM cs_first_contact_catalog
@@ -1145,6 +1904,11 @@ class CustomerServiceRepository:
     ) -> None:
         """Permanently close the first-contact reservation after read-back."""
         with self._connection() as connection:
+            connection.execute("""UPDATE cs_recontact_windows SET status='sent',updated_at=?
+                WHERE reservation_id=? AND status='reserved'""", (_timestamp(updated_at), reservation_id))
+            connection.execute("""UPDATE cs_contact_guards SET welcome_status='sent',
+                closed_reason=COALESCE(closed_reason,'welcome_sent'),updated_at=? WHERE reservation_id=?""",
+                (_timestamp(updated_at), reservation_id))
             connection.execute(
                 """
                 UPDATE cs_first_contact_catalog
@@ -1154,6 +1918,146 @@ class CustomerServiceRepository:
                 """,
                 (_timestamp(updated_at), conversation_key, reservation_id),
             )
+
+    def observe_contact_snapshot(self, snapshot: ConversationSnapshot, *, observed_at: datetime) -> None:
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            observe_contact(connection, snapshot, _timestamp(observed_at))
+
+    def contact_policy(self, conversation_key: str, *, reservation_id: str | None = None) -> dict[str, object]:
+        with self._connection() as connection:
+            return contact_decision(connection, conversation_key, reservation_id)
+
+    def observe_customer_contact_turn(
+        self, snapshot: ConversationSnapshot, current: Sequence[ChatMessage], *,
+        turn_id: str, observed_at: datetime,
+    ) -> None:
+        """Persist the inactivity gap when a genuinely new customer batch arrives."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            key = bind_contact(connection, snapshot.conversation_key, _timestamp(observed_at),
+                               snapshot.platform_customer_id, snapshot.merchant_account_id)
+            observe_recontact_turn(connection, key, snapshot, current, turn_id=turn_id,
+                                   observed_at=observed_at, templates=stored_contact_templates(connection))
+
+    def remember_contact_template(self, message: str, *, observed_at: datetime) -> None:
+        if not message.strip():
+            return
+        with self._connection() as connection:
+            connection.execute("""INSERT OR IGNORE INTO cs_contact_templates
+                (template_fingerprint,message_text,created_at) VALUES(?,?,?)""",
+                (content_fingerprint(message), message, _timestamp(observed_at)))
+
+    def contact_templates(self) -> tuple[str, ...]:
+        with self._connection() as connection:
+            return stored_contact_templates(connection)
+
+    def record_send_contact_policy(self, send_id: str, *, purpose: str, contains_welcome: bool) -> None:
+        with self._connection() as connection:
+            connection.execute("UPDATE cs_quality_sends SET reply_purpose=?,contains_welcome=? WHERE send_id=?",
+                               (purpose, int(contains_welcome), send_id))
+
+    def check_contact_submission(self, send_id: str, evidence: dict[str, object], *, observed_at: datetime) -> str | None:
+        """Check the adapter's final fresh snapshot before its first submit click."""
+        now = _timestamp(observed_at)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM cs_quality_sends WHERE send_id=?", (send_id,)).fetchone()
+            if row is None:
+                return "提交前找不到发送记录"
+            key = bind_contact(connection, str(row["conversation_key"]), now)
+            binding = connection.execute("SELECT identity_source FROM cs_contact_bindings WHERE conversation_key=?",
+                                         (row["conversation_key"],)).fetchone()
+            merchant_id = evidence.get("merchant_account_id")
+            buyer_id = evidence.get("platform_customer_id")
+            if binding and binding["identity_source"] == "merchant_buyer_id":
+                if merchant_id and buyer_id and key != "buyer-" + content_fingerprint(str(merchant_id), str(buyer_id)):
+                    close_contact(connection, key, "identity_conflict", now)
+                    return "提交前商家或顾客身份与已绑定会话不一致"
+                if row["contains_welcome"] and (not merchant_id or not buyer_id or merchant_id == buyer_id):
+                    return "提交前无法重新确认首轮话术的商家和顾客身份"
+            for item in evidence.get("order_observations", []):
+                record_order(connection, key, str(row["conversation_key"]), OrderEvidence(**item), now)
+            policy = contact_decision(connection, str(row["conversation_key"]), send_id)
+            if evidence.get("role_uncertain"):
+                return "提交前最新消息角色无法确认"
+            templates = stored_contact_templates(connection)
+            visible_template = any(contains_contact_template(str(m.get("text") or ""), templates)
+                                   for m in evidence.get("contact_message_evidence", []) if isinstance(m, dict))
+            if row["contains_welcome"] and policy.get("recontact"):
+                if (row["turn_id"] != policy.get("recontact_turn_id")
+                        or evidence.get("last_customer_key") != policy.get("last_customer_message_key")):
+                    return "提交前15分钟接待话术对应的顾客消息已变化"
+                baseline = set(policy.get("baseline_keys") or ())
+                if any(isinstance(m, dict) and m.get("direction") in {"outgoing", "unknown"}
+                       and m.get("message_key") not in baseline
+                       for m in evidence.get("contact_message_evidence", [])):
+                    return "提交前顾客新问题之后出现商家介入或角色不明消息，取消接待话术"
+            if (row["contains_welcome"] and not policy.get("recontact")
+                    and (evidence.get("visible_merchant_history") or evidence.get("visible_catalog") or visible_template)):
+                close_contact(connection, key, "submission_existing_history", now)
+                return "提交前已发现商家历史或首轮目录，取消首轮话术"
+            if row["contains_welcome"] and not policy["allowed"]:
+                return "提交前首次话术资格已关闭：" + str(policy["reason"])
+            if row["reply_purpose"] == "follow_up" and policy["order_state"]:
+                return "提交前已发现订单，取消未下单追问"
+            if policy["order_state"]:
+                from xianyu_assistant.customer_service.sales import (
+                    checkout_guidance_variant_in_text,
+                )
+                if checkout_guidance_variant_in_text(str(row["final_text"])) is not None:
+                    return "提交前已发现订单，取消重新拍单引导"
+        return None
+
+    def normalize_snapshot_roles(self, snapshot: ConversationSnapshot) -> ConversationSnapshot:
+        """Separate author proof, submission candidates, and template push suppression."""
+        messages = []
+        templates = self.contact_templates()
+        with self._connection() as connection:
+            for message in snapshot.messages:
+                original = message
+                if message.direction is not MessageDirection.OUTGOING and message.key_source not in {"content_fallback", "position_fallback"}:
+                    verified = connection.execute("""SELECT final_text FROM cs_quality_sends
+                        WHERE conversation_key=? AND outgoing_message_key=? AND status='verified'""",
+                        (snapshot.conversation_key, message.message_key)).fetchone()
+                    if verified and content_fingerprint(str(verified[0])) == content_fingerprint(message.text or ""):
+                        conflict = message.direction is MessageDirection.INCOMING and message.role_source in {"platform_sender_id", "platform_self_flag"}
+                        message = replace(message, direction=MessageDirection.UNKNOWN if conflict else MessageDirection.OUTGOING,
+                                          role_source="verified_sender_conflict" if conflict else "verified_send_id",
+                                          role_confidence="unknown" if conflict else "trusted")
+                if message.direction is MessageDirection.INCOMING:
+                    pending = connection.execute("""SELECT evidence_json FROM cs_quality_sends
+                        WHERE conversation_key=? AND reply_fingerprint=?
+                        AND status IN ('sending','uncertain','prepared','verified_unrecorded','persistence_failed')""",
+                        (snapshot.conversation_key, content_fingerprint(message.text or ""))).fetchall()
+                    for row in pending:
+                        try:
+                            evidence = json.loads(row[0] or "{}")
+                        except (ValueError, TypeError):
+                            continue
+                        # A reliable buyer ID/self flag defeats a mere content match.
+                        if (message.message_key not in evidence.get("baseline_keys", [])
+                                and evidence.get("submitted_at") and evidence.get("click_state") in {"click_returned", "may_have_submitted"}
+                                and message.role_source not in {"platform_sender_id", "platform_self_flag", "platform_attribute"}):
+                            message = replace(message, direction=MessageDirection.UNKNOWN,
+                                              role_source="pending_submission_candidate", role_confidence="unknown")
+                            break
+                    if message.direction is MessageDirection.INCOMING and not role_is_trusted(message.direction, message.role_source):
+                        message = replace(message, direction=MessageDirection.UNKNOWN,
+                                          role_source="template_role_uncertain" if contains_contact_template(message.text or "", templates) or looks_like_full_catalog(message.text or "") else "role_unresolved",
+                                          role_confidence="unknown")
+                if message != original:
+                    try:
+                        evidence = json.loads(original.role_evidence_json)
+                    except (ValueError, TypeError):
+                        evidence = {}
+                    evidence.update(original_direction=original.direction.value,
+                                    original_role_source=original.role_source,
+                                    normalized_direction=message.direction.value,
+                                    normalized_role_source=message.role_source)
+                    message = replace(message, role_evidence_json=json.dumps(evidence, ensure_ascii=False))
+                messages.append(message)
+        return replace(snapshot, messages=tuple(messages))
 
     def observe_customer_turn(
         self,
@@ -1267,6 +2171,51 @@ class CustomerServiceRepository:
                 ),
             )
 
+    def load_pending_reply_question(
+        self, conversation_key: str, *, exclude_turn_id: str,
+    ) -> dict[str, object] | None:
+        """Recover only the latest decided turn's verified model clarification.
+
+        Reuse the existing decision/send ledger: no migration, extra state or
+        unconfirmed send becomes an unanswered question. Later decisions close
+        earlier questions. The current turn may be regenerated or reviewed.
+        """
+        from xianyu_assistant.customer_service.reply_questions import (
+            QUESTION_VERSION,
+            asks_battery_model,
+        )
+
+        closed: dict[str, object] = {"version": QUESTION_VERSION, "missing_fields": []}
+        with self._connection() as connection:
+            state = connection.execute("SELECT human_owned FROM cs_conversation_states WHERE conversation_key=?",
+                                       (conversation_key,)).fetchone()
+            if state and state[0]:
+                return closed
+            row = connection.execute("""SELECT turn_id,status,decision_json FROM cs_customer_turns
+                WHERE conversation_key=? AND turn_id<>? AND decision_json IS NOT NULL
+                ORDER BY conversation_version DESC LIMIT 1""", (conversation_key, exclude_turn_id)).fetchone()
+            if row is None:
+                return None
+            try:
+                pending = json.loads(row["decision_json"]).get("reply_question")
+            except (ValueError, TypeError, AttributeError):
+                return closed
+            if not isinstance(pending, dict):
+                # A decided legacy turn has no durable unanswered-question
+                # evidence. Never scan behind it and revive an older question.
+                return closed
+            if (row["status"] != "sent" or pending.get("version") != QUESTION_VERSION
+                    or pending.get("missing_fields") != ["battery_model"]):
+                return closed
+            sends = connection.execute("""SELECT outgoing_message_key,final_text FROM cs_quality_sends
+                WHERE conversation_key=? AND turn_id=? AND status='verified'
+                ORDER BY created_at DESC LIMIT 2""", (conversation_key, row["turn_id"])).fetchall()
+            if (len(sends) != 1 or not sends[0]["outgoing_message_key"]
+                    or not asks_battery_model(sends[0]["final_text"])):
+                return closed
+            return {**pending, "turn_id": row["turn_id"],
+                    "clarification_message_key": sends[0]["outgoing_message_key"]}
+
     def reserve_send(
         self,
         *,
@@ -1282,6 +2231,14 @@ class CustomerServiceRepository:
         """Atomically reserve a send only for the still-current conversation version."""
         now = _timestamp(created_at)
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            blocked = connection.execute("""SELECT 1 FROM cs_submission_tombstones
+                WHERE conversation_key=? AND permission_issued=1 AND state<>'not_performed' AND
+                (state IN ('authorized','uncertain','persistence_failed') OR
+                 (action_type='text' AND turn_fingerprint=?)) LIMIT 1""",
+                (conversation_key, turn_id)).fetchone()
+            if blocked is not None:
+                return False
             row = connection.execute(
                 "SELECT version, human_owned FROM cs_conversation_states WHERE conversation_key = ?",
                 (conversation_key,),
@@ -1293,8 +2250,12 @@ class CustomerServiceRepository:
                 (send_id,),
             ).fetchone()
             if existing is not None:
+                if str(existing["status"]) == "not_performed":
+                    connection.execute("""UPDATE cs_send_outbox SET reply_fingerprint=?,
+                        status='reserved',updated_at=? WHERE send_id=?""", (reply_fingerprint, now, send_id))
+                    return True
                 return (
-                    str(existing["status"]) == "reserved"
+                    str(existing["status"]) in {"reserved", "not_performed"}
                     and str(existing["reply_fingerprint"]) == reply_fingerprint
                 )
             connection.execute(
@@ -1394,6 +2355,9 @@ class CustomerServiceRepository:
                     _timestamp(updated_at),
                 ),
             )
+            connection.execute("""UPDATE cs_sales_states SET pre_submit_retry_count=0,
+                defer_reason=NULL,follow_up_expires_at=? WHERE conversation_key=?""",
+                (_timestamp((state.follow_up_due_at or updated_at) + timedelta(hours=2)), state.conversation_key))
 
     def cancel_sales_follow_up(self, conversation_key: str, *, updated_at: datetime) -> None:
         """Cancel only a still-pending follow-up; completed history remains auditable."""
@@ -1427,6 +2391,10 @@ class CustomerServiceRepository:
         if limit <= 0:
             return []
         with self._connection() as connection:
+            connection.execute("""UPDATE cs_sales_states SET status='cancelled',follow_up_text=NULL,
+                follow_up_due_at=NULL,defer_reason='追问已超过有效期',updated_at=?
+                WHERE status='pending' AND follow_up_expires_at IS NOT NULL
+                AND follow_up_expires_at<=?""", (_timestamp(now), _timestamp(now)))
             rows = connection.execute(
                 """
                 SELECT conversation_key, product_key, stage, follow_up_text,
@@ -1553,6 +2521,74 @@ class CustomerServiceRepository:
             str(row["price_variant"]),
         )
 
+    def backfill_current_battery_chemistry(self) -> dict[str, object]:
+        """Back up, then append missing chemistry once without rewriting other facts."""
+        with self._connection() as connection:
+            previous = connection.execute(
+                "SELECT value FROM cs_settings WHERE name = ?",
+                (BATTERY_CHEMISTRY_MIGRATION_SETTING,),
+            ).fetchone()
+            if previous is not None:
+                return json.loads(previous["value"])
+
+        # SQLite backup includes committed WAL data. Complete it before any mutation.
+        backup_dir = self._database_path.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = backup_dir / f"before-battery-chemistry-{uuid4().hex}.db"
+        source = sqlite3.connect(self._database_path.resolve().as_uri() + "?mode=ro", uri=True)
+        target = sqlite3.connect(backup_path)
+        try:
+            source.backup(target)
+            if target.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+                raise sqlite3.DatabaseError("电池类型更新前的备份完整性检查失败。")
+        finally:
+            target.close()
+            source.close()
+
+        now = _timestamp()
+        report: dict[str, object] = {
+            "updated": [], "known": [], "conflicts": [], "absent": [],
+            "backup_path": str(backup_path.resolve()), "completed_at": now,
+        }
+        with self._connection() as connection:
+            # Claim the migration and update only the specification column atomically.
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                "SELECT value FROM cs_settings WHERE name = ?",
+                (BATTERY_CHEMISTRY_MIGRATION_SETTING,),
+            ).fetchone()
+            if previous is not None:
+                return json.loads(previous["value"])
+            for key in CURRENT_TOWER_PRODUCT_KEYS:
+                row = connection.execute(
+                    "SELECT specifications, supplementary_knowledge FROM cs_products "
+                    "WHERE product_key = ?", (key,),
+                ).fetchone()
+                if row is None:
+                    report["absent"].append(key)
+                    continue
+                status = battery_chemistry_status(
+                    row["specifications"], row["supplementary_knowledge"],
+                )
+                if status != "missing":
+                    report["conflicts" if status == "conflict" else "known"].append(key)
+                    continue
+                specifications = row["specifications"]
+                separator = "" if not specifications or specifications.endswith("\n") else "\n"
+                connection.execute(
+                    "UPDATE cs_products SET specifications = ?, updated_at = ? WHERE product_key = ?",
+                    (specifications + separator + BATTERY_CHEMISTRY_LINE, now, key),
+                )
+                report["updated"].append(key)
+            connection.execute(
+                "INSERT INTO cs_settings (name, value) VALUES (?, ?)",
+                (BATTERY_CHEMISTRY_MIGRATION_SETTING, json.dumps(report, ensure_ascii=False)),
+            )
+            for row in connection.execute("SELECT * FROM cs_products").fetchall():
+                self._save_fact_snapshot(connection, self._product_from_row(connection, row))
+        logging.getLogger(__name__).info("电池类型资料补齐完成：%s", json.dumps(report, ensure_ascii=False))
+        return report
+
     def save_product_knowledge(self, product: ProductKnowledge) -> None:
         """Create or update one user-maintained product knowledge entry."""
         now = _timestamp()
@@ -1607,6 +2643,7 @@ class CustomerServiceRepository:
                     if alias.strip()
                 ],
             )
+            self._save_fact_snapshot(connection, product)
 
     def list_product_knowledge(self, *, include_disabled: bool = True) -> list[ProductKnowledge]:
         """List product knowledge for the settings UI."""
@@ -2395,6 +3432,11 @@ class CustomerServiceRepository:
         """Persist a fixed-price proposal with a 15-day audit lifetime."""
         now = _timestamp()
         with self._connection() as connection:
+            if draft.status in {PriceChangeStatus.AWAITING_REVIEW, PriceChangeStatus.APPLYING}:
+                guard = connection.execute("SELECT state FROM cs_submission_tombstones WHERE action_id=?",
+                                           (draft.task_id,)).fetchone()
+                if guard is not None and guard["state"] not in {"prepared", "not_performed"}:
+                    raise ValueError("该改价已有提交凭据，禁止改回待执行状态。")
             connection.execute(
                 """
                 INSERT INTO cs_price_change_tasks (
@@ -2522,7 +3564,7 @@ class CustomerServiceRepository:
         )
 
     def recover_interrupted_reply_jobs(self, *, recovered_at: datetime) -> int:
-        """Close abandoned pipeline states without retrying an uncertain send."""
+        """Requeue only operations proved to have no submission permission."""
         now = _timestamp(recovered_at)
         expires_at = _timestamp(recovered_at + timedelta(days=15))
         recoverable = (
@@ -2534,52 +3576,103 @@ class CustomerServiceRepository:
         )
         placeholders = ",".join("?" for _ in recoverable)
         with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             interrupted = connection.execute(
                 f"""
                 UPDATE cs_reply_jobs
                 SET status = 'failed',
-                    failure_reason = '程序上次运行中断，已安全重新排队。',
+                    failure_reason = '读取或生成中断，等待重新读取最新会话。',
+                    failure_code = 'interrupted_before_submission',
+                    recovery_state = 'recovery_pending',
                     updated_at = ?
-                WHERE status IN ({placeholders})
+                WHERE status IN ({placeholders}) AND NOT EXISTS
+                    (SELECT 1 FROM cs_submission_tombstones t WHERE t.action_id=cs_reply_jobs.job_id
+                     AND t.permission_issued=1
+                     AND t.state IN ('authorized','uncertain','persistence_failed'))
                 """,
                 (now, *recoverable),
             )
+            # Migrate old recovery markers once; runtime code uses the stored code.
+            legacy = connection.execute("""UPDATE cs_reply_jobs SET
+                failure_code='interrupted_before_submission',recovery_state='recovery_pending',updated_at=?
+                WHERE status='failed' AND failure_code IS NULL
+                AND failure_reason='程序上次运行中断，已安全重新排队。'
+                AND NOT EXISTS (SELECT 1 FROM cs_submission_tombstones t
+                    WHERE t.action_id=cs_reply_jobs.job_id AND t.permission_issued=1)""", (now,))
+            pre_submit = connection.execute("""UPDATE cs_reply_jobs SET status='failed',
+                failure_code='interrupted_before_submission',recovery_state='recovery_pending',
+                failure_reason='提交许可发出前中断，等待重新读取最新会话。',updated_at=?
+                WHERE status='sending' AND EXISTS
+                    (SELECT 1 FROM cs_submission_tombstones t WHERE t.action_id=cs_reply_jobs.job_id
+                     AND t.permission_issued=0)""", (now,))
             uncertain_rows = connection.execute(
-                "SELECT conversation_key FROM cs_reply_jobs WHERE status = 'sending'"
+                """SELECT conversation_key, job_id, batch_fingerprint FROM cs_reply_jobs WHERE status='sending'
+                    OR EXISTS (SELECT 1 FROM cs_submission_tombstones t
+                        WHERE t.action_id=cs_reply_jobs.job_id AND t.permission_issued=1
+                        AND t.state IN ('authorized','uncertain','persistence_failed'))"""
             ).fetchall()
             sending = connection.execute(
                 """
                 UPDATE cs_reply_jobs
                 SET status = 'handoff',
                     failure_reason = '程序在发送确认阶段中断，禁止自动重发，请人工核对。',
+                    failure_code = 'interrupted_submission',recovery_state = 'manual_required',
                     updated_at = ?
-                WHERE status = 'sending'
+                WHERE status = 'sending' OR EXISTS
+                    (SELECT 1 FROM cs_submission_tombstones t WHERE t.action_id=cs_reply_jobs.job_id
+                     AND t.permission_issued=1
+                     AND t.state IN ('authorized','uncertain','persistence_failed'))
                 """,
                 (now,),
             )
             for row in uncertain_rows:
                 conversation_key = str(row["conversation_key"])
-                connection.execute(
-                    """
-                    INSERT INTO cs_handoff_events (
-                        conversation_key, reason, status, handoff_type,
-                        release_on_resolve, created_at, content_expires_at
-                    )
-                    SELECT ?, ?, 'open', 'general', 1, ?, ?
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM cs_handoff_events
-                        WHERE conversation_key = ? AND status = 'open'
-                    )
-                    """,
-                    (
-                        conversation_key,
-                        "程序在发送确认阶段中断，禁止自动重发，请人工核对。",
-                        now,
-                        expires_at,
-                        conversation_key,
-                    ),
-                )
-        return interrupted.rowcount + sending.rowcount
+                evidence = connection.execute("SELECT evidence_json FROM cs_quality_sends WHERE send_id=?",
+                                              (row["job_id"],)).fetchone()
+                technical = evidence is not None and bool(evidence["evidence_json"])
+                connection.execute("""INSERT INTO cs_handoff_events
+                    (conversation_key,reason,status,handoff_type,release_on_resolve,created_at,
+                     content_expires_at,related_send_id)
+                    SELECT ?,?,'open',?,1,?,?,? WHERE NOT EXISTS
+                    (SELECT 1 FROM cs_handoff_events WHERE conversation_key=? AND status='open')""",
+                    (conversation_key, "程序在发送确认阶段中断，禁止自动重发，请人工核对。",
+                     "technical_send" if technical else "general", now, expires_at,
+                     row["job_id"], conversation_key))
+            # The minimum lock survives cleanup even for old submissions without a journal.
+            for row in uncertain_rows:
+                connection.execute("""INSERT OR IGNORE INTO cs_submission_tombstones
+                    (action_id,action_type,conversation_key,turn_fingerprint,binding_hash,permission_issued,state,
+                     failure_code,created_at,updated_at)
+                    VALUES (?,'text',?,?,'legacy',1,'uncertain','interrupted_submission',?,?)""",
+                    (row["job_id"], row["conversation_key"], row["batch_fingerprint"], now, now))
+            connection.execute("""UPDATE cs_submission_tombstones SET state='not_performed',
+                failure_code='interrupted_before_submission',updated_at=?
+                WHERE permission_issued=0 AND action_id IN
+                    (SELECT job_id FROM cs_reply_jobs WHERE recovery_state='recovery_pending')""", (now,))
+            price_rows = connection.execute("SELECT * FROM cs_price_change_tasks WHERE status='applying'").fetchall()
+            for row in price_rows:
+                guard = connection.execute("SELECT * FROM cs_submission_tombstones WHERE action_id=?",
+                                           (row["task_id"],)).fetchone()
+                if guard is not None and guard["state"] == "verified":
+                    connection.execute("""UPDATE cs_price_change_tasks SET status='applied',
+                        failure_code=NULL,recovery_state='recovered',failure_reason=NULL,updated_at=?
+                        WHERE task_id=?""", (now, row["task_id"]))
+                    continue
+                no_permission = guard is not None and not guard["permission_issued"]
+                connection.execute("""UPDATE cs_price_change_tasks SET status=?,failure_code=?,
+                    recovery_state=?,failure_reason=?,updated_at=? WHERE task_id=?""",
+                    ("awaiting_review" if no_permission else "failed",
+                     "interrupted_before_submission" if no_permission else "interrupted_submission",
+                     "recovery_pending" if no_permission else "manual_required",
+                     "最终确认前中断，需重新核对订单。" if no_permission else "改价确认中断，禁止重提，请人工核对订单。",
+                     now, row["task_id"]))
+                if not no_permission:
+                    connection.execute("""INSERT OR IGNORE INTO cs_submission_tombstones
+                        (action_id,action_type,conversation_key,turn_fingerprint,binding_hash,permission_issued,state,
+                         failure_code,created_at,updated_at)
+                        VALUES (?,'price',?,?,'legacy',1,'uncertain','interrupted_submission',?,?)""",
+                        (row["task_id"], row["conversation_key"], row["customer_message_key"], now, now))
+        return interrupted.rowcount + legacy.rowcount + pre_submit.rowcount + sending.rowcount + len(price_rows)
 
     def has_prior_reply_job(self, conversation_key: str, *, exclude_job_id: str) -> bool:
         """Check whether a conversation has already reached an earlier question batch."""
@@ -2973,9 +4066,10 @@ class CustomerServiceRepository:
         created_at: datetime,
         handoff_type: str = "general",
         release_on_resolve: bool = True,
+        related_send_id: str | None = None,
     ) -> None:
         """Persist one open in-app notification per conversation."""
-        if handoff_type not in {"general", "post_delivery"}:
+        if handoff_type not in {"general", "post_delivery", "technical_send"}:
             raise ValueError("转人工通知类型无效。")
         expires_at = _timestamp(created_at + timedelta(days=15))
         with self._connection() as connection:
@@ -2997,8 +4091,8 @@ class CustomerServiceRepository:
                     """
                     INSERT INTO cs_handoff_events (
                         conversation_key, reason, status, handoff_type,
-                        release_on_resolve, created_at, content_expires_at
-                    ) VALUES (?, ?, 'open', ?, ?, ?, ?)
+                        release_on_resolve, created_at, content_expires_at, related_send_id
+                    ) VALUES (?, ?, 'open', ?, ?, ?, ?, ?)
                     """,
                     (
                         conversation_key,
@@ -3007,6 +4101,7 @@ class CustomerServiceRepository:
                         int(release_on_resolve),
                         _timestamp(created_at),
                         expires_at,
+                        related_send_id,
                     ),
                 )
                 handoff_id = int(cursor.lastrowid)
@@ -3017,7 +4112,8 @@ class CustomerServiceRepository:
                         """
                         UPDATE cs_handoff_events
                         SET reason = ?, status = 'open', created_at = ?,
-                            content_expires_at = ?
+                            content_expires_at = ?, handoff_type='post_delivery',
+                            release_on_resolve=0, related_send_id=NULL
                         WHERE id = ?
                         """,
                         (reason, _timestamp(created_at), expires_at, handoff_id),
@@ -3112,6 +4208,8 @@ class CustomerServiceRepository:
 
     def has_open_handoff(self, conversation_key: str) -> bool:
         """Check whether this conversation is isolated for human handling."""
+        if self.has_unresolved_submission(conversation_key):
+            return True
         with self._connection() as connection:
             row = connection.execute(
                 """
@@ -3166,7 +4264,7 @@ class CustomerServiceRepository:
         with self._connection() as connection:
             existing = connection.execute(
                 """
-                SELECT conversation_key, release_on_resolve FROM cs_handoff_events
+                SELECT conversation_key, release_on_resolve, related_send_id FROM cs_handoff_events
                 WHERE id = ? AND status = 'open'
                 """,
                 (event_id,),
@@ -3183,6 +4281,20 @@ class CustomerServiceRepository:
             )
             conversation_key = str(existing["conversation_key"])
             release_on_resolve = bool(existing["release_on_resolve"])
+            if release_on_resolve:
+                connection.execute("""UPDATE cs_submission_tombstones SET state='manual_resolved',
+                    failure_code='manually_handled',updated_at=?
+                    WHERE ((? IS NOT NULL AND action_id=?) OR (? IS NULL AND conversation_key=?))
+                    AND state IN ('authorized','uncertain','persistence_failed')""",
+                    (_timestamp(), existing["related_send_id"], existing["related_send_id"],
+                     existing["related_send_id"], conversation_key))
+            # "Handled" closes the old turn; only a subsequent customer turn may auto-reply.
+            connection.execute("""INSERT OR IGNORE INTO cs_processed_fingerprints
+                (batch_fingerprint,observed_at)
+                SELECT batch_fingerprint,? FROM cs_reply_jobs
+                WHERE conversation_key=? AND status='handoff'""", (_timestamp(), conversation_key))
+            connection.execute("""UPDATE cs_quality_sends SET next_check_at=NULL
+                WHERE conversation_key=? AND status='uncertain'""", (conversation_key,))
             mapping = connection.execute(
                 """
                 SELECT customer_key FROM cs_customer_conversations
@@ -3192,6 +4304,16 @@ class CustomerServiceRepository:
             ).fetchone()
             if mapping is not None and release_on_resolve:
                 customer_key = str(mapping["customer_key"])
+                other_lock = connection.execute("""SELECT 1 FROM cs_handoff_events h
+                    JOIN cs_customer_conversations c ON c.conversation_key=h.conversation_key
+                    WHERE c.customer_key=? AND h.status='open' LIMIT 1""",
+                    (customer_key,)).fetchone()
+                fulfillment_lock = connection.execute("""SELECT 1 FROM cs_conversation_fulfillment f
+                    JOIN cs_customer_conversations c ON c.conversation_key=f.conversation_key
+                    WHERE c.customer_key=? AND f.automation_status='human_owned' LIMIT 1""",
+                    (customer_key,)).fetchone()
+                if other_lock is not None or fulfillment_lock is not None:
+                    return cursor.rowcount == 1
                 lifecycle_row = connection.execute(
                     "SELECT lifecycle FROM cs_customers WHERE customer_key = ?",
                     (customer_key,),
@@ -3443,10 +4565,16 @@ class CustomerServiceRepository:
             ("cs_send_outbox", "send_id", "updated_at"),
             ("cs_conversation_states", "conversation_key", "updated_at"),
         ):
+            keep_unresolved = (
+                " AND NOT EXISTS (SELECT 1 FROM cs_submission_tombstones t "
+                "WHERE t.conversation_key=cs_handoff_events.conversation_key "
+                "AND t.permission_issued=1 AND t.state IN ('authorized','uncertain','persistence_failed'))"
+                if table == "cs_handoff_events" else ""
+            )
             while True:
                 with self._connection() as connection:
                     ids = connection.execute(
-                        f"SELECT {key_column} FROM {table} WHERE {expiry_column} < ? "
+                        f"SELECT {key_column} FROM {table} WHERE {expiry_column} < ?{keep_unresolved} "
                         f"ORDER BY {key_column} LIMIT ?",
                         (cutoff, batch_size),
                     ).fetchall()
@@ -3457,6 +4585,14 @@ class CustomerServiceRepository:
                         [(row[key_column],) for row in ids],
                     )
                     deleted += len(ids)
+        with self._connection() as connection:
+            connection.execute("""UPDATE cs_handoff_events SET
+                reason='历史提交待人工核对，禁止重提；处理后仅接待后续新顾客消息。'
+                WHERE status='open' AND content_expires_at<? AND EXISTS
+                    (SELECT 1 FROM cs_submission_tombstones t
+                     WHERE t.conversation_key=cs_handoff_events.conversation_key
+                     AND t.permission_issued=1 AND t.state IN ('authorized','uncertain','persistence_failed'))""",
+                (cutoff,))
         while True:
             with self._connection() as connection:
                 keys = connection.execute(
@@ -3470,6 +4606,37 @@ class CustomerServiceRepository:
                     [(str(row["conversation_key"]),) for row in keys],
                 )
                 deleted += len(keys)
+        quality_cutoff = _timestamp(current - timedelta(days=90))
+        with self._connection() as connection:
+            # Tombstones never expire; they contain no reply/price prose. Drop old
+            # evidence content while retaining identity hashes and unresolved locks.
+            connection.execute("""UPDATE cs_submission_tombstones SET evidence_json=NULL
+                WHERE updated_at<? AND evidence_json IS NOT NULL""", (quality_cutoff,))
+            connection.execute("DELETE FROM cs_media_cache WHERE expires_at<=?", (_timestamp(current),))
+        for table, key_column, time_column in (
+            ("cs_quality_messages", "rowid", "last_seen_at"),
+            ("cs_quality_sends", "rowid", "updated_at"),
+            ("cs_send_attempts", "rowid", "updated_at"),
+            ("cs_send_checks", "rowid", "updated_at"),
+            ("cs_quality_decisions", "rowid", "updated_at"),
+            ("cs_quality_events", "id", "created_at"),
+            ("cs_browser_operations", "request_id", "updated_at"),
+            ("cs_runtime_recoveries", "event_id", "created_at"),
+            ("cs_runtime_configs", "run_id", "updated_at"),
+        ):
+            while True:
+                with self._connection() as connection:
+                    ids = connection.execute(
+                        f"SELECT {key_column} FROM {table} WHERE {time_column} < ? LIMIT ?",
+                        (quality_cutoff, batch_size),
+                    ).fetchall()
+                    if not ids:
+                        break
+                    connection.executemany(
+                        f"DELETE FROM {table} WHERE {key_column} = ?",
+                        [(row[key_column],) for row in ids],
+                    )
+                    deleted += len(ids)
         return deleted
 
     def cleanup_if_due(
@@ -3499,7 +4666,7 @@ class CustomerServiceRepository:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self._database_path)
+        connection = sqlite3.connect(self._database_path, timeout=self.busy_timeout_seconds)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:

@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
+import time
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+from xianyu_assistant.customer_service.business_replies import BUSINESS_REPLY_SETTING_PREFIX
 from xianyu_assistant.customer_service.current_catalog import (
     CURRENT_PRODUCTS,
     FIRST_CONTACT_CATALOG_REPLY,
@@ -18,6 +25,9 @@ from xianyu_assistant.customer_service.customer_service_worker import (
     _classify_customer_state,
     _current_operating_policy_reply,
     _listing_teaser_reply,
+    _recent_negotiation_context,
+    _trusted_quantity_totals,
+    _validate_generated_numbers,
     parse_reply_proposal,
 )
 from xianyu_assistant.customer_service.models import (
@@ -207,6 +217,17 @@ class FakeRepository:
         self.negotiation_states: dict[str, tuple[NegotiationState, str]] = {}
         self.sales_states: dict[str, SalesState] = {}
         self.fulfillment_states: dict[str, ConversationFulfillmentState] = {}
+        self.checkout_guidance_variant: int | None = None
+
+    def load_checkout_guidance_variant(self, conversation_key: str) -> int | None:
+        del conversation_key
+        return self.checkout_guidance_variant
+
+    def mark_checkout_guidance_sent(
+        self, conversation_key: str, *, variant: int, sent_at: datetime
+    ) -> None:
+        del conversation_key, sent_at
+        self.checkout_guidance_variant = variant
 
     def find_product_knowledge(self, *, platform_product_id=None, normalized_title=None):
         return self.product
@@ -611,6 +632,14 @@ def test_current_sales_business_rules_are_deterministic() -> None:
     assert "容量测试视频" in (video.handoff_reason or "")
 
 
+def test_configured_business_wording_keeps_shipping_restrictions(tmp_path: Path) -> None:
+    repository = CustomerServiceRepository(tmp_path / "assistant.db")
+    repository.initialize()
+    repository.set_setting(BUSINESS_REPLY_SETTING_PREFIX + "pickup", "可以在广东普宁自提")
+    assert _current_operating_policy_reply("能自提吗", repository=repository).reply_text == "可以在广东普宁自提"
+    assert _current_operating_policy_reply("海南能发吗", repository=repository).reply_text == "海南不发货"
+
+
 def test_worker_persists_durable_customer_state_with_real_repository(
     tmp_path: Path,
 ) -> None:
@@ -645,6 +674,21 @@ def test_worker_persists_durable_customer_state_with_real_repository(
         event.event_type
         for event in reversed(repository.list_customer_state_events(profile.customer_key))
     ] == ["customer_turn_classified", "merchant_reply_sent"]
+    with sqlite3.connect(repository.database_path) as connection:
+        quality_send = connection.execute(
+            "SELECT origin, status, final_text FROM cs_quality_sends WHERE conversation_key = 'c1'"
+        ).fetchone()
+        captured = connection.execute(
+            "SELECT direction, text FROM cs_quality_messages WHERE conversation_key = 'c1'"
+        ).fetchall()
+        decision_count = connection.execute(
+            "SELECT COUNT(*) FROM cs_quality_decisions WHERE conversation_key = 'c1'"
+        ).fetchone()[0]
+    assert quality_send is not None
+    assert quality_send[:2] == ("application_auto", "verified")
+    assert quality_send[2] in adapter.sent
+    assert captured == [("incoming", "6030 650可以吗")]
+    assert decision_count == 1
 
 
 def test_paid_customer_is_classified_as_ordered() -> None:
@@ -1278,7 +1322,77 @@ def test_checkout_guidance_switch_changes_only_opted_in_run() -> None:
         clock.advance(10)
         worker.run_once()
 
-        assert adapter.sent == ["可以\n在这个链接拍就行" if enabled else "可以"]
+        if enabled:
+            assert len(adapter.sent) == 1
+            assert adapter.sent[0].startswith("可以\n点右上角“立即购买”")
+            assert "改好价格通知你后再付款" in adapter.sent[0]
+        else:
+            assert adapter.sent == ["可以"]
+
+
+def test_accepted_bargain_guidance_is_recorded_after_verified_send() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    repository.product = next(
+        product for product in CURRENT_PRODUCTS if product.product_key == "current-tieta-60v20ah"
+    )
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "6020 398元"),
+        (MessageDirection.INCOMING, "6020 380可以吗"),
+    )})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("380可以"),
+        config=CustomerServiceConfig(
+            mode=ReceptionMode.AUTO_SEND,
+            checkout_guidance_enabled=True,
+        ),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0].startswith("380可以\n")
+    assert "立即购买" in adapter.sent[0]
+    assert "待付款" in adapter.sent[0]
+    assert repository.checkout_guidance_variant == 0
+
+
+def test_unverified_guidance_send_does_not_advance_customer_variant() -> None:
+    clock = FakeClock()
+    repository = FirstContactRepository()
+    repository.product = next(
+        product for product in CURRENT_PRODUCTS if product.product_key == "current-tieta-60v20ah"
+    )
+    adapter = UnconfirmedSendAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "6020 398元"),
+        (MessageDirection.INCOMING, "6020怎么拍"),
+    )})
+    worker = CustomerServiceWorker(
+        adapter,
+        repository,
+        FakeModel("可以"),
+        config=CustomerServiceConfig(
+            mode=ReceptionMode.AUTO_SEND,
+            checkout_guidance_enabled=True,
+        ),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert len(adapter.sent) == 1
+    assert repository.checkout_guidance_variant is None
 
 
 def test_checkout_guidance_does_not_follow_up_after_saved_price_message() -> None:
@@ -1509,6 +1623,61 @@ def test_ambiguous_numeric_turn_uses_model_semantics_before_reply_generation() -
     assert prompt["customer_semantics"]["entities"]["money_offer"] is None
 
 
+def test_short_counteroffer_uses_visible_price_exchange_after_restart() -> None:
+    snapshot = _dialog_snapshot(
+        "c1",
+        (MessageDirection.INCOMING, "6020 350行不行"),
+        (MessageDirection.OUTGOING, "不行 398"),
+        (MessageDirection.INCOMING, "那370呢"),
+    )
+    assert _recent_negotiation_context(snapshot.messages, snapshot.messages[-1:], "那370呢")
+    assert not _recent_negotiation_context(
+        snapshot.messages, snapshot.messages[-1:], "25公里呢"
+    )
+
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": snapshot})
+    repository = FakeRepository()
+    repository.product = next(
+        product for product in CURRENT_PRODUCTS
+        if product.product_key == "current-tieta-60v20ah"
+    )
+    repository.saved.append(
+        ReplyDraft(
+            job_id="earlier-job",
+            conversation_key="c1",
+            batch_fingerprint="earlier-batch",
+            reply_text="不行 398",
+            status=ReplyJobStatus.SENT,
+        )
+    )
+    worker = _worker(adapter, clock, repository, FakeModel("370不行 398"))
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+    assert worker.drafts.list()[-1].reply_text != "你说的这个数字是价格还是电池参数？"
+    assert "不行" in worker.drafts.list()[-1].reply_text
+
+
+def test_exact_multi_unit_total_is_trusted_but_other_totals_are_not() -> None:
+    knowledge = next(
+        product for product in CURRENT_PRODUCTS
+        if product.product_key == "current-tieta-60v20ah"
+    )
+    calculated = _trusted_quantity_totals(knowledge, 2)
+    assert "796" in calculated
+    _validate_generated_numbers(
+        ReplyProposal(reply_text="两组796元"), knowledge, (),
+        trusted_calculated_numbers=calculated,
+    )
+    with pytest.raises(ValueError, match="未获当前知识支持"):
+        _validate_generated_numbers(
+            ReplyProposal(reply_text="两组795元"), knowledge, (),
+            trusted_calculated_numbers=calculated,
+        )
+
+
 def test_non_negotiation_range_number_cannot_be_rendered_as_rejected_offer() -> None:
     clock = FakeClock()
     adapter = FakeAdapter({"c1": _snapshot("c1", "60伏20安，25公里的多少钱")})
@@ -1566,7 +1735,8 @@ def test_restarted_worker_restores_accepted_price_for_purchase_howto() -> None:
     assert prompt["negotiation_decision"]["outcome"] == "accept"
     assert prompt["negotiation_decision"]["accepted_price"] == "85"
     worker_draft = restarted_worker.drafts.list()[-1]
-    assert worker_draft.reply_text == "直接拍下就行 还是按85"
+    assert worker_draft.reply_text.startswith("直接拍下就行 还是按85\n")
+    assert "立即购买" in worker_draft.reply_text
     assert repository.price_changes == []
 
 
@@ -1644,7 +1814,8 @@ def test_bluetooth_selection_adjusts_negotiation_facts_and_floor() -> None:
     assert prompt["customer_memory"][-1] == (
         "顾客已选择加装蓝牙模块，商品价格在基础价格上增加20元"
     )
-    assert worker.drafts.list()[-1].reply_text == "400可以"
+    assert worker.drafts.list()[-1].reply_text.startswith("400可以\n")
+    assert "立即购买" in worker.drafts.list()[-1].reply_text
 
 
 def test_bluetooth_cancellation_restores_base_catalog_price() -> None:
@@ -1677,7 +1848,8 @@ def test_bluetooth_cancellation_restores_base_catalog_price() -> None:
     assert prompt["product"]["listed_price"] == "398.00"
     assert prompt["negotiation_decision"]["outcome"] == "accept"
     assert all("蓝牙模块" not in item for item in prompt["customer_memory"])
-    assert worker.drafts.list()[-1].reply_text == "380可以"
+    assert worker.drafts.list()[-1].reply_text.startswith("380可以\n")
+    assert "立即购买" in worker.drafts.list()[-1].reply_text
 
 
 def test_short_confirmation_after_bluetooth_question_selects_option() -> None:
@@ -1973,6 +2145,51 @@ def test_confirmed_default_carriers_reply_without_handoff_or_model() -> None:
     assert model.calls == 0
 
 
+def test_pickup_question_uses_fixed_reply_without_model() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "您好"),
+        (MessageDirection.INCOMING, "可以自提吗？"),
+    )})
+    repository = FakeRepository()
+    model = FakeModel("不应调用模型")
+    worker = _worker(adapter, clock, repository, model)
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert worker.drafts.list()[-1].reply_text == "广东普宁自提"
+    assert model.calls == 0
+
+
+def test_pickup_question_auto_sends_only_fixed_reply() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "您好"),
+        (MessageDirection.INCOMING, "支持自提吗？"),
+    )})
+    model = FakeModel("不应调用模型")
+    worker = CustomerServiceWorker(
+        adapter,
+        FakeRepository(),
+        model,
+        config=CustomerServiceConfig(mode=ReceptionMode.AUTO_SEND),
+        clock=clock,
+    )
+
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+
+    assert adapter.sent == ["广东普宁自提"]
+    assert model.calls == 0
+
+
 def test_short_price_follow_up_reuses_latest_customer_model() -> None:
     clock = FakeClock()
     adapter = FakeAdapter(
@@ -1988,6 +2205,7 @@ def test_short_price_follow_up_reuses_latest_customer_model() -> None:
         }
     )
     repository = FakeRepository()
+    repository.product = replace(repository.product, listed_price="428.00")
     repository.curated_answers = [
         HistoricalExample("current-test-price", "60V20Ah多少钱", "60V20Ah 428元", "user_curated")
     ]
@@ -2100,6 +2318,7 @@ def test_customer_model_answer_inherits_previous_price_intent() -> None:
         }
     )
     repository = FakeRepository()
+    repository.product = replace(repository.product, listed_price="428.00")
     repository.curated_answers = [
         HistoricalExample("current-test-price", "60V20Ah多少钱", "60V20Ah 428元", "user_curated")
     ]
@@ -2140,6 +2359,7 @@ def test_customer_correction_uses_last_model_in_current_message() -> None:
         }
     )
     repository = FakeRepository()
+    repository.product = replace(repository.product, listed_price="658.00")
     repository.curated_answers = [
         HistoricalExample("current-test-price", "60V30Ah多少钱", "60V30Ah 658元", "user_curated")
     ]
@@ -2179,6 +2399,7 @@ def test_split_voltage_and_capacity_are_merged_across_clarification_turn() -> No
         }
     )
     repository = FakeRepository()
+    repository.product = replace(repository.product, listed_price="658.00")
     repository.curated_answers = [
         HistoricalExample("current-test-price", "60V30Ah多少钱", "60V30Ah 658元", "user_curated")
     ]
@@ -2262,6 +2483,7 @@ def test_multiple_models_in_current_question_are_all_kept() -> None:
         }
     )
     repository = FakeRepository()
+    repository.product = replace(repository.product, listed_price="428.00")
     repository.curated_answers = [
         HistoricalExample("current-test-price-6020", "60V20Ah多少钱", "60V20Ah 428元", "user_curated"),
         HistoricalExample("current-test-price-6030", "60V30Ah多少钱", "60V30Ah 658元", "user_curated"),
@@ -2275,7 +2497,7 @@ def test_multiple_models_in_current_question_are_all_kept() -> None:
             status=ReplyJobStatus.SENT,
         )
     )
-    model = FakeModel("6020 428元 6030 658元")
+    model = FakeModel("6020 428元 6030 428元")
     worker = _worker(adapter, clock, repository, model)
 
     worker.start()
@@ -2291,7 +2513,38 @@ def test_multiple_models_in_current_question_are_all_kept() -> None:
         "顾客当前同时询问6020，对应60V20Ah",
         "顾客当前同时询问6030，对应60V30Ah",
     ]
-    assert worker.drafts.list()[-1].reply_text == "6020 428元 6030 658元"
+    assert worker.drafts.list()[-1].reply_text == "6020 428元 6030 428元"
+
+
+def test_price_change_after_draft_invalidates_reply_before_send() -> None:
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _dialog_snapshot(
+        "c1",
+        (MessageDirection.OUTGOING, "你要哪个型号"),
+        (MessageDirection.INCOMING, "这个多少钱"),
+    )})
+    repository = FakeRepository()
+    repository.list_product_knowledge = lambda *, include_disabled=False: [repository.product]
+    repository.saved.append(ReplyDraft(
+        job_id="earlier-job",
+        conversation_key="c1",
+        batch_fingerprint="earlier-batch",
+        reply_text="已回复",
+        status=ReplyJobStatus.SENT,
+    ))
+    worker = _worker(adapter, clock, repository, FakeModel("99元"))
+    worker.start()
+    worker.run_once()
+    clock.advance(10)
+    worker.run_once()
+    draft = worker.drafts.list()[-1]
+    assert draft.status is ReplyJobStatus.AWAITING_REVIEW
+
+    repository.product = replace(repository.product, listed_price="120.00")
+    result = worker.approve_draft(draft.job_id)
+
+    assert result.status is ReplyJobStatus.SUPERSEDED
+    assert adapter.sent == []
 
 
 class RepairingPriceModel(FakeModel):
@@ -2438,7 +2691,8 @@ def test_handoff_isolates_only_that_conversation_and_other_customers_continue() 
     )
     worker.run_once()
 
-    assert adapter.opened.count("needs-human") == handoff_open_count
+    assert adapter.opened.count("needs-human") == handoff_open_count + 1
+    assert adapter.sent == ["6030尺寸17-18-32"]
     assert worker.status is ReceptionStatus.RUNNING
 
 
@@ -2716,6 +2970,96 @@ def test_transient_page_structure_failure_recovers_without_global_halt() -> None
     worker.run_once()
 
     assert worker.status is ReceptionStatus.RUNNING
+
+
+def test_unavailable_browser_requests_recovery_without_repeating_a_send() -> None:
+    adapter = SequencedHealthAdapter(
+        {},
+        [PageHealth(PageHealthStatus.HEALTHY), PageHealth(PageHealthStatus.UNAVAILABLE)],
+    )
+    worker = CustomerServiceWorker(adapter, FakeRepository(), FakeModel())
+    worker.start()
+    worker.run_once()
+    assert worker.browser_recovery_needed is True
+    assert worker.status is ReceptionStatus.RUNNING
+    assert adapter.sent == []
+    worker.browser_recovered()
+    assert worker.browser_recovery_needed is False
+
+
+def test_slow_model_does_not_block_other_conversations() -> None:
+    class BlockingModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def complete_text(self, *, system_prompt: str, user_prompt: str, model: str) -> ModelResponse:
+            self.started.set()
+            self.release.wait(3)
+            return super().complete_text(system_prompt=system_prompt, user_prompt=user_prompt, model=model)
+
+    clock = FakeClock()
+    adapter = FakeAdapter({
+        "c1": _snapshot("c1", "6030尺寸能装吗？"),
+        "c2": _snapshot("c2", "可以自提吗？"),
+    })
+    model = BlockingModel()
+    worker = CustomerServiceWorker(
+        adapter, FakeRepository(), model, clock=clock, async_model_calls=True,
+    )
+    try:
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        started = time.monotonic()
+        worker.run_once()
+        assert time.monotonic() - started < 1.5
+        assert model.started.wait(1)
+        assert any(draft.conversation_key == "c2" and draft.status is ReplyJobStatus.AWAITING_REVIEW
+                   for draft in worker.drafts.list())
+    finally:
+        model.release.set()
+        worker.close()
+
+
+def test_stale_model_result_is_discarded_after_new_customer_message() -> None:
+    class BlockingModel(FakeModel):
+        def __init__(self) -> None:
+            super().__init__("旧消息回复")
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def complete_text(self, *, system_prompt: str, user_prompt: str, model: str) -> ModelResponse:
+            self.started.set()
+            self.release.wait(3)
+            return super().complete_text(system_prompt=system_prompt, user_prompt=user_prompt, model=model)
+
+    clock = FakeClock()
+    adapter = FakeAdapter({"c1": _snapshot("c1", "6030尺寸能装吗？")})
+    model = BlockingModel()
+    worker = CustomerServiceWorker(
+        adapter, FakeRepository(), model, clock=clock, async_model_calls=True,
+    )
+    try:
+        worker.start()
+        worker.run_once()
+        clock.advance(10)
+        worker.run_once()
+        assert model.started.wait(1)
+        adapter.snapshots["c1"] = _snapshot("c1", "6030尺寸能装吗？", "改问6020了")
+        worker.run_once()
+        model.release.set()
+        for _ in range(20):
+            if not any(not item.done() for item in worker._model_futures.values()):
+                break
+            time.sleep(0.01)
+        worker.run_once()
+        assert any(draft.status is ReplyJobStatus.SUPERSEDED for draft in worker.drafts.list())
+        assert adapter.sent == []
+    finally:
+        model.release.set()
+        worker.close()
 
 
 def test_repeated_page_structure_failure_halts_at_configured_threshold() -> None:

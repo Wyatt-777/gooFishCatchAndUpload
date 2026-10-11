@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 
+from xianyu_assistant.customer_service.battery_models import model_matches
+from xianyu_assistant.customer_service.contact_policy import is_order_card, order_state_from_text
 from xianyu_assistant.customer_service.fingerprints import normalize_for_matching
 
 _NUMBER_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)(?!\d)")
@@ -125,14 +127,17 @@ def analyze_customer_turn(
     powers = collect(_POWER_RE, "motor_power_w")
     voltages = collect(_VOLTAGE_RE, "voltage")
     capacities = collect(_CAPACITY_RE, "capacity")
-    compact_models = collect(_COMPACT_BATTERY_RE, "battery_model")
+    compact_models = model_matches(folded)
+    for match in compact_models:
+        occupied.append(match.span())
+        evidence.append((match.group(0), "battery_model"))
     quantities = collect(_QUANTITY_RE, "quantity")
     money_units = collect(_MONEY_UNIT_RE, "money_offer")
 
     battery_model: str | None = None
     if compact_models:
-        raw = re.sub(r"\s+", "", compact_models[-1].group(1))
-        battery_model = f"{raw[:2]}V{raw[2:]}Ah"
+        match = compact_models[-1]
+        battery_model = f"{match[1] or match[3]}V{match[2] or match[4]}Ah"
     elif voltages and capacities:
         battery_model = (
             f"{_plain_number(voltages[-1].group(1))}V"
@@ -183,7 +188,13 @@ def analyze_customer_turn(
         or negotiation_active
     )
     is_order_request = any(marker in folded for marker in _ORDER_MARKERS)
-    if is_negotiation:
+    if is_order_card(text):
+        inferred_money = None
+        is_negotiation = False
+        questions = [question for question in questions if question != "price"]
+    if order_state_from_text(text) is not None and not is_negotiation:
+        primary_intent = "order_status"
+    elif is_negotiation:
         primary_intent = "price_negotiation"
     elif "price" in questions:
         primary_intent = "price_inquiry"
@@ -285,6 +296,12 @@ def parse_and_guard_model_semantics(
         _plain_number(match.group(1))
         for match in _COMPACT_BATTERY_RE.finditer(normalize_for_matching(customer_text))
     )
+    # The shared grammar also covers omitted Ah. Do not let a semantic model
+    # reinterpret either component of 60V30 (or compact 6030) as a price.
+    for match in model_matches(customer_text):
+        typed_values.update(_plain_number(value) for value in (
+            match[1] or match[3], match[2] or match[4],
+        ))
     if model_offer in typed_values:
         model_offer = None
         model_negotiation = False
